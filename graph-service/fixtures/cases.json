@@ -1,0 +1,282 @@
+[
+  {
+    "id": "count",
+    "question": "一共有几笔订单？",
+    "sql": "SELECT COUNT(*) AS n FROM sales",
+    "columns": [
+      "n"
+    ],
+    "rows": [
+      [
+        5
+      ]
+    ]
+  },
+  {
+    "id": "gross",
+    "question": "总销售额是多少？",
+    "sql": "SELECT SUM(gross) AS gross FROM sales",
+    "columns": [
+      "gross"
+    ],
+    "rows": [
+      [
+        1500
+      ]
+    ]
+  },
+  {
+    "id": "refund",
+    "question": "总退款是多少？",
+    "sql": "SELECT SUM(refund) AS refund FROM sales",
+    "columns": [
+      "refund"
+    ],
+    "rows": [
+      [
+        80
+      ]
+    ]
+  },
+  {
+    "id": "net",
+    "question": "总净销售额是多少？",
+    "sql": "SELECT SUM(gross-refund) AS net FROM sales",
+    "columns": [
+      "net"
+    ],
+    "rows": [
+      [
+        1420
+      ]
+    ]
+  },
+  {
+    "id": "july-net",
+    "question": "七月净销售额？",
+    "sql": "SELECT SUM(gross-refund) AS net FROM sales WHERE month='2026-07'",
+    "columns": [
+      "net"
+    ],
+    "rows": [
+      [
+        290
+      ]
+    ]
+  },
+  {
+    "id": "august-net",
+    "question": "八月净销售额？",
+    "sql": "SELECT SUM(gross-refund) AS net FROM sales WHERE month='2026-08'",
+    "columns": [
+      "net"
+    ],
+    "rows": [
+      [
+        1130
+      ]
+    ]
+  },
+  {
+    "id": "east-net",
+    "question": "东部净销售额？",
+    "sql": "SELECT SUM(gross-refund) AS net FROM sales WHERE region='east'",
+    "columns": [
+      "net"
+    ],
+    "rows": [
+      [
+        860
+      ]
+    ]
+  },
+  {
+    "id": "west-net",
+    "question": "西部净销售额？",
+    "sql": "SELECT SUM(gross-refund) AS net FROM sales WHERE region='west'",
+    "columns": [
+      "net"
+    ],
+    "rows": [
+      [
+        560
+      ]
+    ]
+  },
+  {
+    "id": "by-region",
+    "question": "按区域统计净销售额",
+    "sql": "SELECT region,SUM(gross-refund) AS net FROM sales GROUP BY region ORDER BY region",
+    "columns": [
+      "region",
+      "net"
+    ],
+    "rows": [
+      [
+        "east",
+        860
+      ],
+      [
+        "west",
+        560
+      ]
+    ]
+  },
+  {
+    "id": "by-month",
+    "question": "按月统计净销售额",
+    "sql": "SELECT month,SUM(gross-refund) AS net FROM sales GROUP BY month ORDER BY month",
+    "columns": [
+      "month",
+      "net"
+    ],
+    "rows": [
+      [
+        "2026-07",
+        290
+      ],
+      [
+        "2026-08",
+        1130
+      ]
+    ]
+  },
+  {
+    "id": "average",
+    "question": "平均订单金额？",
+    "sql": "SELECT AVG(gross) AS average FROM sales",
+    "columns": [
+      "average"
+    ],
+    "rows": [
+      [
+        300.0
+      ]
+    ]
+  },
+  {
+    "id": "maximum",
+    "question": "最大订单金额？",
+    "sql": "SELECT MAX(gross) AS maximum FROM sales",
+    "columns": [
+      "maximum"
+    ],
+    "rows": [
+      [
+        500
+      ]
+    ]
+  },
+  {
+    "id": "minimum",
+    "question": "最小订单金额？",
+    "sql": "SELECT MIN(gross) AS minimum FROM sales",
+    "columns": [
+      "minimum"
+    ],
+    "rows": [
+      [
+        100
+      ]
+    ]
+  },
+  {
+    "id": "refunded-count",
+    "question": "有退款的订单数？",
+    "sql": "SELECT COUNT(*) AS n FROM sales WHERE refund>0",
+    "columns": [
+      "n"
+    ],
+    "rows": [
+      [
+        3
+      ]
+    ]
+  },
+  {
+    "id": "no-refund",
+    "question": "无退款订单金额？",
+    "sql": "SELECT SUM(gross) AS gross FROM sales WHERE refund=0",
+    "columns": [
+      "gross"
+    ],
+    "rows": [
+      [
+        700
+      ]
+    ]
+  },
+  {
+    "id": "empty",
+    "question": "九月的订单有哪些？",
+    "sql": "SELECT id FROM sales WHERE month='2026-09'",
+    "columns": [
+      "id"
+    ],
+    "rows": []
+  },
+  {
+    "id": "empty-total",
+    "question": "九月总销售额，空值按零显示",
+    "sql": "SELECT COALESCE(SUM(gross),0) AS gross FROM sales WHERE month='2026-09'",
+    "columns": [
+      "gross"
+    ],
+    "rows": [
+      [
+        0
+      ]
+    ]
+  },
+  {
+    "id": "top-two",
+    "question": "金额最高的两笔订单？",
+    "sql": "SELECT id,gross FROM sales ORDER BY gross DESC LIMIT 2",
+    "columns": [
+      "id",
+      "gross"
+    ],
+    "rows": [
+      [
+        5,
+        500
+      ],
+      [
+        4,
+        400
+      ]
+    ]
+  },
+  {
+    "id": "east-august",
+    "question": "东部八月净销售额？",
+    "sql": "SELECT SUM(gross-refund) AS net FROM sales WHERE region='east' AND month='2026-08'",
+    "columns": [
+      "net"
+    ],
+    "rows": [
+      [
+        770
+      ]
+    ]
+  },
+  {
+    "id": "by-region-count",
+    "question": "各区域订单数？",
+    "sql": "SELECT region,COUNT(*) AS n FROM sales GROUP BY region ORDER BY region",
+    "columns": [
+      "region",
+      "n"
+    ],
+    "rows": [
+      [
+        "east",
+        3
+      ],
+      [
+        "west",
+        2
+      ]
+    ]
+  }
+]

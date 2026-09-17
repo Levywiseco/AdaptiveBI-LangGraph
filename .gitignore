@@ -8,6 +8,7 @@ node_modules/
 *.lock
 *-lock.json
 !backend/uv.lock
+!graph-service/uv.lock
 !frontend/package-lock.json
 components.d.ts
 

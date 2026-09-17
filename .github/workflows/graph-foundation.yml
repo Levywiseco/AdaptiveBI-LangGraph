@@ -1,0 +1,24 @@
+name: Graph foundation
+on:
+  pull_request:
+    paths: ['graph-service/**', '.github/workflows/graph-foundation.yml']
+  push:
+    branches: [main, 'codex/**']
+    paths: ['graph-service/**', '.github/workflows/graph-foundation.yml']
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: graph-service
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: '0.12.10'
+          python-version: '3.11'
+      - run: uv sync --locked
+      - run: uv run --frozen pytest -q
+      - run: uv run --frozen python evaluate.py

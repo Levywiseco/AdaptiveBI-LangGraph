@@ -2,6 +2,8 @@ name: Synchronize to Gitee
 on: [push]
 jobs:
   repo-sync:
+    # Inherited external mirror is not used by this independent repository.
+    if: ${{ false }}
     runs-on: ubuntu-latest
     steps:
       - name: Mirror the Github organization repos to Gitee.

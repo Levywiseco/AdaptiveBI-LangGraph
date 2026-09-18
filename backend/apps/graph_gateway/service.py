@@ -15,7 +15,11 @@ from common.core.db import engine
 from apps.graph_gateway.security import enabled
 
 MODEL_SLOTS = asyncio.Semaphore(4)
-SCHEMA = "sales(id INTEGER, month TEXT, region TEXT, gross INTEGER, refund INTEGER); net = gross - refund"
+SCHEMA = (
+    "sales(id INTEGER, month TEXT, region TEXT, gross INTEGER, refund INTEGER); net = gross - refund. "
+    "month stores YYYY-MM text, for example '2026-08' (August 2026), not full dates. "
+    "region stores 'east' (East / 东部) or 'west' (West / 西部)."
+)
 
 
 def authorize_current(uid: int, oid: int):

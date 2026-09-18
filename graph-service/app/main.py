@@ -5,15 +5,24 @@ from pathlib import Path
 from uuid import uuid4
 
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import StreamingResponse
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse, StreamingResponse
 from langchain_core.language_models.fake_chat_models import FakeListChatModel
 
-from app.contracts import DemoRequest, Principal, RunEvent
+from app.contracts import DemoRequest, Principal, RunEvent, SafeResult
+from app.experiment import router as experiment_router
 from app.graph import build_graph
 from app.synthetic import SyntheticTools
 
 CASES = json.loads((Path(__file__).parent.parent / "fixtures" / "cases.json").read_text(encoding="utf-8"))
 app = FastAPI(title="AdaptiveBI Graph Foundation — synthetic demo", version="0.1.0")
+app.include_router(experiment_router)
+
+
+@app.exception_handler(RequestValidationError)
+async def invalid_request(request, exc):
+    # Validation errors must not echo rejected secrets or identity fields.
+    return JSONResponse(status_code=422, content={"detail": "invalid_request"})
 
 
 @app.get("/health")
@@ -39,7 +48,7 @@ def prepare(case_id: str):
 def run(request: DemoRequest):
     graph, state = prepare(request.case_id)
     return {"mode": "synthetic", "run_id": str(uuid4()),
-            "result": graph.invoke(state, {"recursion_limit": 12})}
+            "result": SafeResult.model_validate(graph.invoke(state, {"recursion_limit": 12})).model_dump()}
 
 
 @app.post("/demo/stream")

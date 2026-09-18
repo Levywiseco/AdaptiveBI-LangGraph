@@ -12,7 +12,6 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from apps.system.crud.apikey_manage import get_api_key
 from apps.system.models.system_model import ApiKeyModel, AssistantModel
 from common.core.db import engine
-from apps.system.crud.assistant import get_assistant_info, get_assistant_user
 from apps.system.crud.user import get_user_by_account, get_user_info
 from apps.system.schemas.system_schema import AssistantHeader, UserInfoDTO
 from common.core import security
@@ -31,6 +30,13 @@ class TokenMiddleware(BaseHTTPMiddleware):
         super().__init__(app)
 
     async def dispatch(self, request, call_next):
+        # These exact internal routes enforce service + signed delegation auth in
+        # their handlers. They must not require an interactive user's login token.
+        if request.url.path in {
+            settings.API_V1_STR + "/internal/graph/model",
+            settings.API_V1_STR + "/internal/graph/authorize",
+        }:
+            return await call_next(request)
         
         if self.is_options(request) or whiteUtils.is_whitelisted(request.url.path):
             # 动态处理 /system/assistant/info/{id} 的 CORS 预检
@@ -174,6 +180,7 @@ class TokenMiddleware(BaseHTTPMiddleware):
             
     
     async def validateAssistant(self, assistantToken: Optional[str], trans: I18n) -> tuple[any]:
+        from apps.system.crud.assistant import get_assistant_info, get_assistant_user
         if not assistantToken:
             return False, f"Miss Token[{settings.TOKEN_KEY}]!"
         schema, param = get_authorization_scheme_param(assistantToken)
@@ -206,6 +213,7 @@ class TokenMiddleware(BaseHTTPMiddleware):
             return False, e
     
     async def validateEmbedded(self, param: str, trans: I18n) -> tuple[any]:
+        from apps.system.crud.assistant import get_assistant_info
         try: 
             # WARNING: Signature verification is disabled for embedded tokens
             # This is a security risk and should only be used if absolutely necessary

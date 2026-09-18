@@ -1,8 +1,10 @@
+import re
+
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import HumanMessage, SystemMessage
 from langgraph.graph import END, START, StateGraph
 
-from app.contracts import Principal, QueryState, QueryTools
+from app.contracts import ModelCallError, Principal, QueryState, QueryTools
 
 
 def build_graph(model: BaseChatModel, tools: QueryTools, principal: Principal):
@@ -27,9 +29,13 @@ def build_graph(model: BaseChatModel, tools: QueryTools, principal: Principal):
                 SystemMessage(content="Return a single SQLite SELECT statement only. Schema: " + state["schema"]),
                 HumanMessage(content=state["question"]),
             ])
-            if not isinstance(response.content, str):
-                return {"status": "failed", "error": "unsupported_model_output"}
+            if (not isinstance(response.content, str) or not response.content.strip()
+                    or len(response.content) > 16000 or "```" in response.content
+                    or not re.match(r"(?is)^\s*(SELECT|WITH|INSERT|UPDATE|DELETE|DROP|ALTER|CREATE|PRAGMA|ATTACH|REPLACE|TRUNCATE)\b", response.content)):
+                return {"status": "failed", "error": "model_output_invalid"}
             return {"sql": response.content.strip()}
+        except ModelCallError as exc:
+            return {"status": "failed", "error": exc.code}
         except Exception:
             return {"status": "failed", "error": "model_call_failed"}
 

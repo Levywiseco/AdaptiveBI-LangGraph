@@ -4,6 +4,8 @@ on:
   workflow_dispatch:
 jobs:
   sync:
+    # Inherited external mirror is not used by this independent repository.
+    if: ${{ false }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

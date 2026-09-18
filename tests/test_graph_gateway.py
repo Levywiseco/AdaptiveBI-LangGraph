@@ -261,3 +261,125 @@ def test_wire_schema_matches_graph_service():
     request_schema, response_schema = json.loads(output)
     assert request_schema["properties"] == QuestionRequest.model_json_schema()["properties"]
     assert response_schema["properties"] == SafeResponse.model_json_schema()["properties"]
+
+@pytest.fixture
+def http_graph_stack(configured, monkeypatch):
+    """Real loopback HTTP across two dependency environments; provider is a stub."""
+    import os
+    import secrets
+    import socket
+    import subprocess
+    import threading
+    import time
+    from pathlib import Path
+    import httpx
+    import uvicorn
+    from apps.system.middleware import auth
+    from apps.system.schemas.system_schema import UserInfoDTO
+    from common.core.response_middleware import ResponseMiddleware
+
+    root = Path(__file__).resolve().parents[1]
+    graph_python = root / "graph-service/.venv/Scripts/python.exe"
+    if not graph_python.exists():
+        graph_python = root / "graph-service/.venv/bin/python"
+    if not graph_python.exists():
+        pytest.skip("independent graph-service environment required")
+    for key in ("BACKEND_TO_GRAPH_TOKEN", "GRAPH_TO_GATEWAY_TOKEN", "GRAPH_DELEGATION_SECRET"):
+        monkeypatch.setattr(settings, key, secrets.token_urlsafe(48))
+    async def user_info(*, session, user_id):
+        user = session.get(UserModel, user_id)
+        return UserInfoDTO.model_validate(user.model_dump()) if user else None
+    monkeypatch.setattr(auth, "engine", configured)
+    monkeypatch.setattr(auth, "get_user_info", user_info)
+    application = FastAPI()
+    application.include_router(api.router, prefix=settings.API_V1_STR)
+    application.add_middleware(auth.TokenMiddleware)
+    application.add_middleware(ResponseMiddleware)
+    backend_socket = socket.socket()
+    backend_socket.bind(("127.0.0.1", 0))
+    backend_url = f"http://127.0.0.1:{backend_socket.getsockname()[1]}"
+    with socket.socket() as reservation:
+        reservation.bind(("127.0.0.1", 0))
+        graph_port = reservation.getsockname()[1]
+    graph_url = f"http://127.0.0.1:{graph_port}"
+    monkeypatch.setattr(settings, "GRAPH_SERVICE_URL", graph_url)
+    environment = {key: value for key, value in os.environ.items()
+                   if key.upper() in {"SYSTEMROOT", "WINDIR", "PATH", "TEMP", "TMP", "HOME", "LANG"}}
+    environment.update({"GRAPH_EXPERIMENT_ENABLED": "true",
+                        "GRAPH_GATEWAY_URL": backend_url + settings.API_V1_STR,
+                        **{key: getattr(settings, key) for key in
+                           ("BACKEND_TO_GRAPH_TOKEN", "GRAPH_TO_GATEWAY_TOKEN", "GRAPH_DELEGATION_SECRET")}})
+    server = uvicorn.Server(uvicorn.Config(application, log_level="critical", access_log=False))
+    thread = threading.Thread(target=server.run, kwargs={"sockets": [backend_socket]}, daemon=True)
+    process = None
+    try:
+        thread.start()
+        process = subprocess.Popen([str(graph_python), "-m", "uvicorn", "app.main:app",
+                                    "--host", "127.0.0.1", "--port", str(graph_port), "--log-level", "critical"],
+                                   cwd=root / "graph-service", env=environment,
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        deadline = time.monotonic() + 20
+        with httpx.Client(timeout=1, trust_env=False) as client:
+            while time.monotonic() < deadline:
+                if process.poll() is not None:
+                    pytest.fail("isolated graph process exited during startup")
+                try:
+                    if server.started and client.get(graph_url + "/openapi.json").status_code == 200:
+                        break
+                except httpx.TransportError:
+                    pass
+                time.sleep(0.1)
+            else:
+                pytest.fail("isolated HTTP stack did not start within 20 seconds")
+            yield backend_url + settings.API_V1_STR, graph_url
+    finally:
+        if process is not None:
+            process.terminate()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=5)
+        server.should_exit = True
+        thread.join(timeout=5)
+        backend_socket.close()
+
+
+@pytest.mark.parametrize("provider_output,expected_status,expected_rows", [
+    ("SELECT SUM(gross-refund) AS net FROM sales WHERE month='2026-08' AND region='east'", "completed", [[770]]),
+    ("DELETE FROM sales", "rejected", []),
+])
+def test_real_http_roundtrip_with_stub_provider(http_graph_stack, monkeypatch,
+                                               provider_output, expected_status, expected_rows):
+    import httpx
+    from datetime import timedelta
+    from apps.ai_model.model_factory import LLMConfig
+    from common.core.security import create_access_token
+    calls = []
+    async def config(model_id):
+        return LLMConfig(model_id=10, model_type="openai", model_name="test")
+    class Model:
+        async def ainvoke(self, messages):
+            calls.append(messages[-1].content)
+            return SimpleNamespace(content=provider_output, usage_metadata=None)
+    monkeypatch.setattr(service, "get_default_config", config)
+    monkeypatch.setattr(service.LLMFactory, "create_llm", lambda _: SimpleNamespace(llm=Model()))
+    backend_url, graph_url = http_graph_stack
+    token = create_access_token({"id": 7}, timedelta(minutes=1))
+    question = "2026年8月东部扣除退款后的销售额是多少？"
+    with httpx.Client(timeout=45, trust_env=False) as client:
+        # Neither a direct graph request nor an anonymous public request can invoke the model.
+        assert client.post(graph_url + "/internal/v1/query", json={
+            "question": question, "run_id": str(uuid4())}).status_code == 401
+        assert client.post(backend_url + "/analysis/query", json={"question": question}).status_code == 401
+        assert calls == []
+        response = client.post(backend_url + "/analysis/query", json={"question": question},
+                               headers={settings.TOKEN_KEY: "Bearer " + token})
+    assert response.status_code == 200
+    data = response.json()["data"]
+    assert data["status"] == expected_status, data
+    assert data["rows"] == expected_rows
+    assert data["model_calls"] == 1 and data["model_config_id"] == 10
+    assert data["usage"] == {"input_tokens": None, "output_tokens": None, "total_tokens": None}
+    assert calls == [question]
+    assert not {"schema", "sql", "prompt", "api_key", "messages"} & data.keys()

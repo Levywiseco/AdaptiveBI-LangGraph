@@ -103,3 +103,13 @@ uv run --frozen python live_smoke.py
 ## 回退
 
 将两个进程的 GRAPH_EXPERIMENT_ENABLED 设为 false 并重启对应测试服务；新入口返回404，旧问答继续原有路径。本包没有数据库迁移。若回退代码，按本PR提交整体 revert，同时恢复图服务锁文件；无需修改客户数据库。
+
+## 后续一步：跨进程 HTTP 联调（2026-09-18）
+
+新增 `tests/test_graph_gateway.py::test_real_http_roundtrip_with_stub_provider`，启动临时旧后端测试应用和独立依赖环境中的图服务，通过真实本机 HTTP 完成公共入口、签名委托、授权回调、模型网关及 SQLite 执行的闭环。只替换供应商模型和登录缓存读取；登录 JWT、TokenMiddleware、响应包装和数据库权限检查使用实际实现。
+
+两项联调通过：东部八月净额返回770；DELETE被拒绝。两项均同时检查未登录及缺少服务身份的请求不会调用模型、安全响应不泄露内部字段、未知用量保持null。测试使用内存元数据库、随机服务秘密和临时端口，退出时关闭两个测试服务，不加载生产启动生命周期、不迁移数据库、不调用真实供应商。
+
+运行方式：在仓库根目录设置 `PYTHONPATH` 为本仓库 backend，使用旧后端依赖环境执行 `python -m pytest tests/test_graph_gateway.py -k real_http -q`；需要先创建 graph-service 的独立虚拟环境。缺少该环境时显式跳过，不视作联调通过。
+
+这补齐了两个运行时之间的 HTTP 验证，不能替代真实模型冒烟；PR-2 业务扩展前仍需配置独立测试模型并通过 live_smoke.py。

@@ -202,6 +202,26 @@ def test_provider_errors_and_unknown_usage(configured, monkeypatch, bad_output):
     assert "private endpoint" not in str(result)
 
 
+def test_model_prompt_declares_synthetic_dimension_values(configured, monkeypatch):
+    captured = []
+    from apps.ai_model.model_factory import LLMConfig
+
+    async def config(model_id):
+        return LLMConfig(model_id=10, model_type="openai", model_name="test")
+
+    class Model:
+        async def ainvoke(self, messages):
+            captured.extend(messages)
+            return SimpleNamespace(content="SELECT 1", usage_metadata=None)
+
+    monkeypatch.setattr(service, "get_default_config", config)
+    monkeypatch.setattr(service.LLMFactory, "create_llm", lambda _: SimpleNamespace(llm=Model()))
+    result = asyncio.run(service.invoke_model({"sub": "7", "workspace": "2", "model_id": 10}, "东部八月净销售额"))
+    assert result["content"] == "SELECT 1"
+    prompt = captured[0].content
+    assert "YYYY-MM" in prompt and "east" in prompt and "东部" in prompt
+
+
 def test_logged_in_query_delegates_and_filters_response(configured, monkeypatch):
     import httpx
     from apps.system.middleware import auth

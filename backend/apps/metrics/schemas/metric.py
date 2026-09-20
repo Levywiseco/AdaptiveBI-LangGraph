@@ -214,6 +214,24 @@ class MetricQueryPlanRead(BaseModel):
     compiler: str = "metric-plan-v1"
 
 
+class MetricCandidateRead(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    metric_id: int
+    metric_code: str
+    metric_name: str
+    aliases: list[str]
+    description: str | None
+    metric_version_id: int
+    metric_version: int
+    dimensions: list[str]
+    time_field: str | None
+    grain: str | None
+    unit: str | None
+    required_tables: list[str]
+    score: int
+
+
 class MetricRead(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 

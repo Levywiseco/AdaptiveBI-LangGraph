@@ -6,6 +6,7 @@ from sqlglot import exp, parse_one
 
 from apps.datasource.models.datasource import CoreDatasource
 from apps.metrics.crud.metric import validate_metric_expression
+from apps.metrics.crud import metric as metric_crud
 from apps.metrics.models.metric import MetricDefinition, MetricVersion
 from apps.metrics.schemas.metric import MetricQueryPlanRequest
 from apps.metrics.service.query_planner import compile_metric_plan
@@ -188,3 +189,36 @@ def test_preserves_and_quotes_catalog_identifier_case():
     assert 'FROM "SalesOrder"' in plan["sql"]
     assert '"SalesOrder"."Amount"' in plan["sql"]
     assert '"SalesOrder"."Region"' in plan["sql"]
+
+
+def test_structured_metric_candidates_expose_plan_fields_but_not_formula(monkeypatch):
+    metric, version, _datasource, _catalog = _objects()
+    metric.aliases = ["净收入"]
+    metric.description = "销售额扣除折扣"
+    version.unit = "CNY"
+    monkeypatch.setattr(
+        metric_crud,
+        "_rank_published_metrics",
+        lambda *args, **kwargs: [(505, metric, version)],
+    )
+
+    candidates = metric_crud.get_metric_candidates(
+        object(), "八月净销售额", 1, 3, current_user=object()
+    )
+
+    assert candidates == [{
+        "metric_id": 9,
+        "metric_code": "net_sales",
+        "metric_name": "净销售额",
+        "aliases": ["净收入"],
+        "description": "销售额扣除折扣",
+        "metric_version_id": 27,
+        "metric_version": 2,
+        "dimensions": ["region"],
+        "time_field": "paid_at",
+        "grain": None,
+        "unit": "CNY",
+        "required_tables": ["adaptive_demo_sales"],
+        "score": 505,
+    }]
+    assert "expression" not in candidates[0] and "filters" not in candidates[0]

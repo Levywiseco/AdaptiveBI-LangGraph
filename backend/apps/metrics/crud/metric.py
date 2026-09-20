@@ -645,6 +645,80 @@ def _metric_version_visible(
     return True
 
 
+def _rank_published_metrics(
+    session: Session,
+    question: str,
+    oid: Optional[int],
+    datasource_id: Optional[int],
+    limit: int,
+    current_user: Any,
+) -> list[tuple[int, MetricDefinition, MetricVersion]]:
+    if not datasource_id or not question.strip():
+        return []
+    now = _now()
+    rows = session.exec(
+        select(MetricDefinition, MetricVersion)
+        .join(MetricVersion, MetricDefinition.current_version_id == MetricVersion.id)
+        .where(
+            and_(
+                MetricDefinition.oid == _oid(oid),
+                MetricDefinition.datasource_id == datasource_id,
+                MetricDefinition.status == "published",
+                MetricVersion.status == "published",
+                or_(MetricVersion.effective_from.is_(None), MetricVersion.effective_from <= now),
+                or_(MetricVersion.effective_to.is_(None), MetricVersion.effective_to > now),
+            )
+        )
+    ).all()
+    datasource = session.get(CoreDatasource, datasource_id)
+    visible_fields = _visible_fields_for_user(session, datasource_id, current_user)
+    return sorted(
+        (
+            (score, metric, version)
+            for metric, version in rows
+            if _metric_version_visible(
+                version,
+                visible_fields,
+                datasource.type if datasource else None,
+            )
+            and (score := _match_score(question, metric)) > 0
+        ),
+        key=lambda item: (-item[0], item[1].code),
+    )[:min(max(limit, 1), 20)]
+
+
+def get_metric_candidates(
+    session: Session,
+    question: str,
+    oid: Optional[int],
+    datasource_id: Optional[int],
+    limit: int = 5,
+    current_user: Any = None,
+) -> list[dict[str, Any]]:
+    """Return safe structured candidates for governed model planning."""
+    ranked = _rank_published_metrics(
+        session, question, oid, datasource_id, limit, current_user
+    )
+    return [
+        {
+            "metric_id": int(metric.id),
+            "metric_code": metric.code,
+            "metric_name": metric.name,
+            "aliases": list(metric.aliases),
+            "description": metric.description,
+            "metric_version_id": int(version.id),
+            "metric_version": version.version,
+            "dimensions": list(version.dimensions),
+            "time_field": version.time_field,
+            "grain": version.grain,
+            "unit": version.unit,
+            "required_tables": list(version.required_tables),
+            "score": score,
+        }
+        for score, metric, version in ranked
+    ]
+
+
 def _render_metric_prompt(
     ranked: list[tuple[int, MetricDefinition, MetricVersion]],
     *,
@@ -709,40 +783,9 @@ def get_metric_prompt(
 ) -> tuple[str, list[dict[str, Any]], list[str]]:
     """Return matching, effective, published metric versions for SQL generation."""
 
-    if not datasource_id or not question.strip():
-        return "", [], []
-    now = _now()
-    rows = session.exec(
-        select(MetricDefinition, MetricVersion)
-        .join(MetricVersion, MetricDefinition.current_version_id == MetricVersion.id)
-        .where(
-            and_(
-                MetricDefinition.oid == _oid(oid),
-                MetricDefinition.datasource_id == datasource_id,
-                MetricDefinition.status == "published",
-                MetricVersion.status == "published",
-                or_(MetricVersion.effective_from.is_(None), MetricVersion.effective_from <= now),
-                or_(MetricVersion.effective_to.is_(None), MetricVersion.effective_to > now),
-            )
-        )
-    ).all()
-
-    datasource = session.get(CoreDatasource, datasource_id)
-    visible_fields = _visible_fields_for_user(session, datasource_id, current_user)
-
-    ranked = sorted(
-        (
-            (score, metric, version)
-            for metric, version in rows
-            if _metric_version_visible(
-                version,
-                visible_fields,
-                datasource.type if datasource else None,
-            )
-            and (score := _match_score(question, metric)) > 0
-        ),
-        key=lambda item: (-item[0], item[1].code),
-    )[:limit]
+    ranked = _rank_published_metrics(
+        session, question, oid, datasource_id, limit, current_user
+    )
     return _render_metric_prompt(ranked)
 
 

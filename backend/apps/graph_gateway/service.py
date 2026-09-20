@@ -14,6 +14,10 @@ from common.core.config import settings
 from common.core.db import engine
 from apps.graph_gateway.security import enabled
 from apps.graph_gateway.model_policy import gateway_model_config
+from apps.metrics.crud.metric import get_metric_candidates
+from apps.metrics.schemas.metric import MetricQueryPlanRequest
+from apps.metrics.service.query_planner import preview_metric_query_plan
+from apps.system.schemas.system_schema import UserInfoDTO
 
 MODEL_SLOTS = asyncio.Semaphore(4)
 SCHEMA = (
@@ -54,6 +58,123 @@ def usage_from(message):
                "total_tokens": legacy.get("total_tokens")}
     return {key: raw[key] if type(raw.get(key)) is int and raw[key] >= 0 else None
             for key in ("input_tokens", "output_tokens", "total_tokens")}
+
+
+def _current_user(session: Session, uid: int, oid: int) -> UserInfoDTO:
+    user = session.get(UserModel, uid)
+    if not user or user.status != 1 or user.oid != oid:
+        raise HTTPException(403, "identity_not_allowed")
+    result = UserInfoDTO.model_validate(user.model_dump())
+    result.isAdmin = result.id == 1 and result.account == "admin"
+    if not result.isAdmin:
+        membership = session.exec(
+            select(UserWsModel).where(UserWsModel.uid == uid, UserWsModel.oid == oid)
+        ).first()
+        result.weight = membership.weight if membership else -1
+    return result
+
+
+def authorized_metric_candidates(claims, question: str, datasource_id: int):
+    uid, oid = int(claims["sub"]), int(claims["workspace"])
+    authorize_current(uid, oid)
+    with Session(engine) as session:
+        current_user = _current_user(session, uid, oid)
+        return get_metric_candidates(
+            session, question, oid, datasource_id, limit=10, current_user=current_user
+        )
+
+
+async def invoke_metric_model(claims, question: str, datasource_id: int, candidate_refs):
+    from langchain_core.messages import HumanMessage, SystemMessage
+
+    candidates = authorized_metric_candidates(claims, question, datasource_id)
+    requested = {(item.metric_id, item.metric_version_id) for item in candidate_refs}
+    if len(requested) != len(candidate_refs):
+        raise HTTPException(422, "metric_candidates_invalid")
+    selected = [item for item in candidates
+                if (item["metric_id"], item["metric_version_id"]) in requested]
+    if not selected or len(selected) != len(requested):
+        raise HTTPException(403, "metric_not_authorized")
+    uid, oid = int(claims["sub"]), int(claims["workspace"])
+    try:
+        await asyncio.wait_for(MODEL_SLOTS.acquire(), timeout=0.2)
+    except asyncio.TimeoutError:
+        raise HTTPException(503, "gateway_busy") from None
+    calls = 0
+    started = perf_counter()
+    provider_family = None
+    usage = {"input_tokens": None, "output_tokens": None, "total_tokens": None}
+    try:
+        config = await get_default_config(settings.GRAPH_MODEL_ID)
+        if config.model_id != claims["model_id"]:
+            raise HTTPException(403, "model_not_allowed")
+        config, policy = gateway_model_config(config)
+        provider_family = policy.family
+        model = LLMFactory.create_llm(config).llm
+        authorize_current(uid, oid)
+        calls = 1
+        message = await asyncio.wait_for(model.ainvoke([
+            SystemMessage(content=(
+                "Select one authorized metric and return one JSON object only. Do not write SQL. "
+                "Use only candidate metric/version IDs, dimensions and time fields. Required keys: "
+                "metric_id, metric_version_id, dimensions, filters, time_range, limit. Candidates: "
+                + json.dumps(selected, ensure_ascii=False, separators=(",", ":"))
+            )),
+            HumanMessage(content=question),
+        ]), timeout=30)
+        usage = usage_from(message)
+        authorize_current(uid, oid)
+        content = message.content
+        if not isinstance(content, str) or not content.strip() or len(content) > 16000:
+            return {"error": "model_output_invalid", "usage": usage, "model_calls": calls}
+        return {"content": content, "usage": usage, "model_calls": calls}
+    except HTTPException:
+        raise
+    except (asyncio.TimeoutError, TimeoutError):
+        return {"error": "model_timeout", "usage": usage, "model_calls": calls}
+    except Exception as exc:
+        error = "model_timeout" if "timeout" in type(exc).__name__.lower() else "model_call_failed"
+        return {"error": error, "usage": usage, "model_calls": calls}
+    finally:
+        logging.getLogger("adaptive.graph_gateway").info("metric_model_usage %s", json.dumps({
+            "run_id": claims.get("run_id"), "model_config_id": claims["model_id"],
+            "provider_family": provider_family, "model_calls": calls, "usage": usage,
+            "elapsed_ms": round((perf_counter() - started) * 1000, 2),
+        }))
+        MODEL_SLOTS.release()
+
+
+def compile_authorized_metric_plan(claims, question: str, datasource_id: int, plan: dict):
+    allowed = {"metric_id", "metric_version_id", "dimensions", "filters", "time_range", "limit"}
+    if not isinstance(plan, dict) or set(plan) != allowed:
+        raise HTTPException(422, "metric_plan_invalid")
+    metric_id = plan.get("metric_id")
+    version_id = plan.get("metric_version_id")
+    if (type(metric_id) is not int or metric_id <= 0
+            or type(version_id) is not int or version_id <= 0):
+        raise HTTPException(422, "metric_plan_invalid")
+    uid, oid = int(claims["sub"]), int(claims["workspace"])
+    authorize_current(uid, oid)
+    try:
+        payload = MetricQueryPlanRequest.model_validate({
+            "version_id": version_id,
+            "dimensions": plan.get("dimensions") or [],
+            "filters": plan.get("filters") or [],
+            "time_range": plan.get("time_range"),
+            "limit": plan.get("limit"),
+        })
+    except Exception:
+        raise HTTPException(422, "metric_plan_invalid") from None
+    with Session(engine) as session:
+        current_user = _current_user(session, uid, oid)
+        compiled = preview_metric_query_plan(session, metric_id, payload, oid, current_user)
+    authorize_current(uid, oid)
+    if compiled["datasource_id"] != datasource_id or compiled["metric_version_id"] != version_id:
+        raise HTTPException(403, "metric_not_authorized")
+    return {key: compiled.get(key) for key in (
+        "metric_id", "metric_code", "metric_name", "metric_version_id", "metric_version",
+        "dimensions", "time_range", "sql_fingerprint", "compiler",
+    )}
 
 
 async def invoke_model(claims, question):

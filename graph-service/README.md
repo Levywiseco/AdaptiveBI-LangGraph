@@ -1,8 +1,8 @@
 # 第一阶段：独立图服务与测试基线
 
-这是可运行的开发骨架，不是已完成迁移的产品后端。
-PR-1 已增加默认关闭的模型网关与同步实验入口，配置见 [网关契约](../docs/langgraph/GATEWAY_CONTRACT.md)。以下 /demo/* 仍为模拟回归。
-真实使用 LangGraph StateGraph 编排、LangChain Core 的模型接口和消息格式；当前模型为 FakeListChatModel，返回案例预设 SQL，不具备真实自然语言理解能力，不产生 API 费用。
+这是可运行的迁移服务，尚未替换产品的默认问答入口。
+PR-1 已增加默认关闭的模型网关与同步实验入口；PR-2 已增加指标候选、模型计划和后端固定编译器之间的签名 HTTP 闭环。配置见 [网关契约](../docs/langgraph/GATEWAY_CONTRACT.md) 和 [指标计划契约](../docs/langgraph/METRIC_PLANNING_CONTRACT.md)。以下 `/demo/*` 仍为模拟回归。
+服务使用 LangGraph StateGraph 编排和 LangChain Core 模型接口。`/demo/*` 使用 FakeListChatModel，不产生 API 费用；内部实验接口通过旧后端的 LLMFactory 调用服务端固定模型。
 
 ## 启动
 
@@ -32,6 +32,15 @@ authorize → retrieve → generate → validate → execute → answer
 任一步拒绝或失败 → 结束
 ```
 
+指标计划路径：
+
+```text
+authorize → candidates → model_plan → validate_plan → compile → answer
+任一步拒绝或失败 → 结束
+```
+
+指标公式、固定过滤器、连接规则和数据库凭据不会进入图状态。模型只选择获授权候选的指标版本、维度、过滤条件和时间范围；旧后端重新读取发布版本并用 `metric-plan-v1` 编译。当前接口只返回计划摘要和 SQL 指纹，不执行客户查询。
+
 - 数据：每次调用创建并销毁内存 SQLite，只有 5 条合成订单。
 - 口径：net = gross - refund，金额为示例整数。
 - 查询：仅单表 SELECT；明确拒绝多语句、写操作、跨表和复杂查询形态。执行层还有 SQLite 授权回调、只读模式、行数限制及计算超时。
@@ -49,10 +58,10 @@ P1 仍需补充真实旧引擎的结果、耗时、用量对照；当前 evaluat
 
 ## 明确未实现
 
-真实模型供应商端到端验证、指标/记忆适配、旧 SSE 映射、前端切换、图表生成、重试修复、澄清中断、持久 checkpoint、取消和生产部署。模型网关与短期身份委托已在 PR-1 实现并进行离线测试。
+指标 SQL 的隔离数据执行、记忆适配、旧 SSE 映射、前端切换、图表生成、重试修复、澄清中断、持久 checkpoint、取消和生产部署。Kimi 已在合成数据网关上做过真实验证；Qwen 只完成离线兼容验证。指标计划闭环当前使用测试供应商完成跨进程验证，尚未用真实指标数据源执行查询。
 图状态暂时包含小型合成结果；生产适配必须改用授权结果引用和保留期。
 本演示只绑定 localhost，不用于公网服务，不连接客户数据库、不加载旧 .env、不执行业务迁移。
 
 ## 下一阶段
 
-定义并实现经过鉴权的模型/数据源网关；保持图节点独立，不能把原 LLMService 整体塞进一个节点。先用测试账号、测试数据库验证，再接入现有前端。
+在隔离测试数据库建立已发布指标，通过现有 Kimi 配置做真实指标计划冒烟；随后增加受控执行节点和结果契约，再接入现有前端的灰度入口。

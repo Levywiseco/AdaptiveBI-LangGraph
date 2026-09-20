@@ -94,7 +94,11 @@ def parse_metric_plan(raw: str, candidates: list[MetricCandidate]) -> MetricQuer
     if not isinstance(raw, str) or not raw.strip() or len(raw) > 16000 or "```" in raw:
         raise MetricPlanningError("metric_plan_invalid")
     try:
-        plan = MetricQueryPlan.model_validate_json(raw)
+        parsed = json.loads(raw)
+        required = {"metric_id", "metric_version_id", "dimensions", "filters", "time_range", "limit"}
+        if not isinstance(parsed, dict) or set(parsed) != required:
+            raise ValueError("metric_plan_keys_invalid")
+        plan = MetricQueryPlan.model_validate(parsed)
     except Exception as exc:
         raise MetricPlanningError("metric_plan_invalid") from exc
 

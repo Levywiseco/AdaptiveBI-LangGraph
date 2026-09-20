@@ -80,6 +80,17 @@ def test_time_range_requires_metric_time_field(candidate):
     assert error.value.code == "metric_time_range_not_allowed"
 
 
+@pytest.mark.parametrize("removed", [
+    "metric_id", "metric_version_id", "dimensions", "filters", "time_range", "limit",
+])
+def test_plan_requires_every_contract_key(candidate, removed):
+    value = json.loads(payload())
+    value.pop(removed)
+    with pytest.raises(MetricPlanningError) as error:
+        parse_metric_plan(json.dumps(value), [candidate])
+    assert error.value.code == "metric_plan_invalid"
+
+
 def test_prompt_contains_no_formula_sql_or_connection_data(candidate):
     messages = planning_prompt("八月东部净销售额", [candidate])
     serialized = json.dumps(messages, ensure_ascii=False)

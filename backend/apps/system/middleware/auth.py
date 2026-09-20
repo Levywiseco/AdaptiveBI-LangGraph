@@ -35,6 +35,10 @@ class TokenMiddleware(BaseHTTPMiddleware):
         if request.url.path in {
             settings.API_V1_STR + "/internal/graph/model",
             settings.API_V1_STR + "/internal/graph/authorize",
+            settings.API_V1_STR + "/internal/graph/metrics/authorize",
+            settings.API_V1_STR + "/internal/graph/metrics/candidates",
+            settings.API_V1_STR + "/internal/graph/metrics/model",
+            settings.API_V1_STR + "/internal/graph/metrics/compile",
         }:
             return await call_next(request)
         

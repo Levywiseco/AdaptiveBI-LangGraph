@@ -21,6 +21,37 @@ class InternalQuestion(QuestionRequest):
     run_id: UUID
 
 
+class MetricQuestionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    question: str = Field(min_length=1, max_length=2000)
+    datasource_id: int = Field(gt=0)
+
+    @field_validator("question")
+    @classmethod
+    def metric_question_not_blank(cls, value):
+        if not value.strip():
+            raise ValueError("question_required")
+        return value
+
+
+class InternalMetricQuestion(MetricQuestionRequest):
+    run_id: UUID
+
+
+class MetricCandidateRef(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    metric_id: int = Field(gt=0)
+    metric_version_id: int = Field(gt=0)
+
+
+class MetricModelRequest(InternalMetricQuestion):
+    candidates: list[MetricCandidateRef] = Field(min_length=1, max_length=20)
+
+
+class MetricCompileRequest(InternalMetricQuestion):
+    plan: dict
+
+
 class ModelUsage(BaseModel):
     input_tokens: int | None = Field(default=None, ge=0)
     output_tokens: int | None = Field(default=None, ge=0)
@@ -41,6 +72,31 @@ class SafeResponse(BaseModel):
                    "gateway_unavailable", "gateway_rejected", "sql_validation_failed",
                    "datasource_access_denied", "query_execution_failed",
                    "graph_execution_failed"] | None = None
+    usage: ModelUsage = Field(default_factory=ModelUsage)
+    model_calls: int | None = Field(default=0, ge=0)
+    elapsed_ms: float = Field(default=0, ge=0)
+
+
+class MetricPlanResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    mode: Literal["metric-plan"] = "metric-plan"
+    run_id: UUID
+    status: Literal["completed", "failed", "rejected"]
+    metric_id: int | None = None
+    metric_code: str | None = None
+    metric_name: str | None = None
+    metric_version_id: int | None = None
+    metric_version: int | None = None
+    dimensions: list[str] = Field(default_factory=list)
+    time_range: dict[str, str] | None = None
+    unit: str | None = None
+    sql_fingerprint: str | None = None
+    compiler: str | None = None
+    error: Literal["metric_not_found", "metric_plan_invalid", "metric_not_authorized",
+                   "metric_dimension_not_allowed", "metric_filter_not_allowed",
+                   "metric_time_range_not_allowed", "metric_compile_failed",
+                   "model_timeout", "model_call_failed", "model_output_invalid",
+                   "gateway_unavailable", "gateway_rejected", "graph_execution_failed"] | None = None
     usage: ModelUsage = Field(default_factory=ModelUsage)
     model_calls: int | None = Field(default=0, ge=0)
     elapsed_ms: float = Field(default=0, ge=0)

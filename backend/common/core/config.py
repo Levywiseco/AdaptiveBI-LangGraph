@@ -40,6 +40,7 @@ class Settings(BaseSettings):
     GRAPH_EXPERIMENT_ENABLED: bool = False
     GRAPH_TEST_USERS: str = ""
     GRAPH_TEST_WORKSPACES: str = ""
+    GRAPH_METRIC_DATASOURCES: str = ""
     GRAPH_MODEL_ID: int = 0
     GRAPH_SERVICE_URL: str = "http://127.0.0.1:8030"
     GRAPH_TO_GATEWAY_TOKEN: str = ""

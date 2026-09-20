@@ -71,3 +71,11 @@
 用户授权复用本地Kimi配置后，已在隔离元数据库和合成数据上完成两次真实供应商调用。首次结果为空，补齐月份格式、地区编码说明后返回预期770，实际用量302 tokens、耗时约6.47秒；两次累计659 tokens。详见 [KIMI_LIVE_VALIDATION.md](KIMI_LIVE_VALIDATION.md)。上述早期 not_executed 记录保留为历史状态。
 
 该结果仅覆盖隔离网关/图服务链路，不代表完整旧系统启动、前端接入或生产部署完成。测试配置仅在进程内存中使用，未将旧密钥或加密私钥写入仓库。
+
+## 多模型兼容补充（2026-09-20）
+
+- 新增模型网关供应商策略。Kimi 和普通 OpenAI-compatible 配置使用公共的超时、重试、输出和非流式限制。
+- 阿里云 Model Studio 的 Qwen 配置会自动增加 `extra_body.enable_thinking=false`，使当前只读取最终SQL的非流式链路不依赖思考流。
+- Qwen 策略、参数覆盖保护和实际 `ChatOpenAI` 模型构造已离线验证；没有Qwen测试密钥，因此尚未执行Qwen真实供应商调用。
+- 最新旧后端完整回归为116 passed、3 skipped；跳过项仍是缺少专用凭据的既有真实供应商测试。
+- 每个测试部署仍由服务端固定一个 `GRAPH_MODEL_ID`，尚未实现客户端选模型、自动回退或多模型投票。具体边界见 [MODEL_COMPATIBILITY.md](MODEL_COMPATIBILITY.md)。

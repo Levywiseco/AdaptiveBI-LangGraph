@@ -13,6 +13,7 @@ from apps.system.models.user import UserModel
 from common.core.config import settings
 from common.core.db import engine
 from apps.graph_gateway.security import enabled
+from apps.graph_gateway.model_policy import gateway_model_config
 
 MODEL_SLOTS = asyncio.Semaphore(4)
 SCHEMA = (
@@ -65,15 +66,16 @@ async def invoke_model(claims, question):
         raise HTTPException(503, "gateway_busy") from None
     started = perf_counter()
     calls = 0
+    provider_family = None
     usage = {"input_tokens": None, "output_tokens": None, "total_tokens": None}
     try:
         config = await get_default_config(settings.GRAPH_MODEL_ID)
         if config.model_id != claims["model_id"]:
             raise HTTPException(403, "model_not_allowed")
-        # Explicitly avoid inherited SDK retry multiplication or config override.
-        config = config.model_copy(update={"additional_params": {
-            "timeout": 25.0, "max_retries": 0, "max_tokens": 2048, "streaming": False,
-        }})
+        # Apply a bounded provider policy instead of forwarding arbitrary saved
+        # request options into this security-sensitive execution path.
+        config, policy = gateway_model_config(config)
+        provider_family = policy.family
         model = LLMFactory.create_llm(config).llm
         authorize_current(uid, oid)
         calls = 1
@@ -100,6 +102,7 @@ async def invoke_model(claims, question):
     finally:
         logging.getLogger("adaptive.graph_gateway").info("graph_model_usage %s", json.dumps({
             "run_id": claims.get("run_id"), "model_config_id": claims["model_id"],
+            "provider_family": provider_family,
             "model_calls": calls, "usage": usage,
             "elapsed_ms": round((perf_counter() - started) * 1000, 2),
         }))

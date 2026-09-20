@@ -143,6 +143,29 @@ def test_model_factory_usage_and_no_session_during_call(configured, monkeypatch)
     assert "never-return" not in str(result) and "reasoning" not in str(result)
 
 
+@pytest.mark.parametrize("model_name,api_base_url,expected_family,expected_extra_body", [
+    ("kimi-k3", "https://api.moonshot.cn/v1", "openai-compatible", None),
+    ("qwen-plus", "https://dashscope.aliyuncs.com/compatible-mode/v1",
+     "qwen-model-studio", {"enable_thinking": False}),
+    ("qwen-plus", "https://example.invalid/v1", "openai-compatible", None),
+])
+def test_gateway_model_provider_policy(model_name, api_base_url, expected_family, expected_extra_body):
+    from apps.ai_model.model_factory import LLMConfig
+    from apps.graph_gateway.model_policy import gateway_model_config
+
+    source = LLMConfig(model_id=10, model_type="openai", model_name=model_name,
+                       api_key="never-return", api_base_url=api_base_url,
+                       additional_params={"timeout": 999, "max_retries": 9,
+                                          "extra_body": {"enable_thinking": True}})
+    configured, policy = gateway_model_config(source)
+    assert policy.family == expected_family
+    assert configured.api_key == "never-return" and configured.api_base_url == api_base_url
+    assert configured.additional_params["timeout"] == 25.0
+    assert configured.additional_params["max_retries"] == 0
+    assert configured.additional_params["streaming"] is False
+    assert configured.additional_params.get("extra_body") == expected_extra_body
+
+
 def test_unauthorized_model_never_reaches_factory(configured, monkeypatch):
     monkeypatch.setattr(service.LLMFactory, "create_llm", lambda *_: pytest.fail("unauthorized model invoked"))
     with pytest.raises(HTTPException):

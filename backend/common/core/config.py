@@ -48,6 +48,8 @@ class Settings(BaseSettings):
     GRAPH_DELEGATION_SECRET: str = ""
     GRAPH_METRIC_MAX_ROWS: int = 200
     GRAPH_METRIC_EXECUTION_TIMEOUT: int = 15
+    CHAT_ENGINE: Literal["legacy", "langgraph"] = "legacy"
+    CHAT_ENGINE_WORKSPACES: str = ""
 
     BACKEND_CORS_ORIGINS: Annotated[
         list[AnyUrl] | str, BeforeValidator(parse_cors)

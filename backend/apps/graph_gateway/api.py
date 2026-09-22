@@ -33,6 +33,7 @@ from apps.graph_gateway.service import (
     execute_authorized_metric_plan,
     invoke_metric_model,
     invoke_model,
+    run_metric_query,
 )
 from common.core.config import settings
 
@@ -127,38 +128,7 @@ async def metric_plan(body: MetricQuestionRequest, request: Request):
 @router.post("/analysis/metrics/query", response_model=MetricQueryResponse)
 async def metric_query(body: MetricQuestionRequest, request: Request):
     user = login_user(request)
-    metric_datasource_enabled(body.datasource_id)
-    authorize_current(user.id, user.oid)
-    run_id = uuid4()
-    token = issue_metric_query_delegation(user.id, user.oid, run_id, body.question, body.datasource_id)
-    try:
-        async with httpx.AsyncClient(timeout=45, follow_redirects=False, trust_env=False) as client:
-            response = await client.post(
-                settings.GRAPH_SERVICE_URL.rstrip("/") + "/internal/v1/metrics/query",
-                json={**body.model_dump(), "run_id": str(run_id)},
-                headers={"X-Graph-Service": settings.BACKEND_TO_GRAPH_TOKEN,
-                         "X-Graph-Delegation": token},
-            )
-        response.raise_for_status()
-        payload = response.json()
-        if not isinstance(payload, dict):
-            raise ValueError("invalid_response")
-        # Same allowlist principle as the plan boundary: even if the graph service
-        # leaked SQL, formulas or prompts, they cannot pass this filter.
-        result = MetricQueryResponse.model_validate({
-            key: value for key, value in payload.items()
-            if key in MetricQueryResponse.model_fields
-        })
-        if result.run_id != run_id:
-            raise ValueError("run_mismatch")
-        authorize_current(user.id, user.oid)
-        return result
-    except HTTPException:
-        raise
-    except httpx.TimeoutException:
-        raise HTTPException(504, "graph_timeout") from None
-    except Exception:
-        raise HTTPException(502, "graph_unavailable") from None
+    return await run_metric_query(user.id, user.oid, body.question, body.datasource_id)
 
 
 @router.post("/internal/graph/authorize")

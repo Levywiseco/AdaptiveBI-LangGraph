@@ -2,7 +2,9 @@ import asyncio
 import json
 import logging
 from time import perf_counter
+from uuid import uuid4
 
+import httpx
 from fastapi import HTTPException
 from sqlmodel import Session, select
 
@@ -13,7 +15,12 @@ from apps.system.models.system_model import AiModelDetail, UserWsModel, Workspac
 from apps.system.models.user import UserModel
 from common.core.config import settings
 from common.core.db import engine
-from apps.graph_gateway.security import enabled
+from apps.graph_gateway.contracts import MetricQueryResponse
+from apps.graph_gateway.security import (
+    enabled,
+    issue_metric_query_delegation,
+    metric_datasource_enabled,
+)
 from apps.graph_gateway.model_policy import gateway_model_config
 from apps.metrics.crud.metric import get_metric_candidates
 from apps.metrics.schemas.metric import MetricQueryPlanRequest
@@ -304,3 +311,41 @@ async def invoke_model(claims, question):
             "elapsed_ms": round((perf_counter() - started) * 1000, 2),
         }))
         MODEL_SLOTS.release()
+
+
+async def run_metric_query(uid: int, oid: int, question: str, datasource_id: int) -> MetricQueryResponse:
+    """Plan and execute one governed metric query through the graph service.
+
+    Shared by the analysis endpoint and the chat-engine router; the response is
+    an explicit allowlist so leaked internal fields cannot pass through.
+    """
+    metric_datasource_enabled(datasource_id)
+    authorize_current(uid, oid)
+    run_id = uuid4()
+    token = issue_metric_query_delegation(uid, oid, run_id, question, datasource_id)
+    try:
+        async with httpx.AsyncClient(timeout=45, follow_redirects=False, trust_env=False) as client:
+            response = await client.post(
+                settings.GRAPH_SERVICE_URL.rstrip("/") + "/internal/v1/metrics/query",
+                json={"question": question, "datasource_id": datasource_id, "run_id": str(run_id)},
+                headers={"X-Graph-Service": settings.BACKEND_TO_GRAPH_TOKEN,
+                         "X-Graph-Delegation": token},
+            )
+        response.raise_for_status()
+        payload = response.json()
+        if not isinstance(payload, dict):
+            raise ValueError("invalid_response")
+        result = MetricQueryResponse.model_validate({
+            key: value for key, value in payload.items()
+            if key in MetricQueryResponse.model_fields
+        })
+        if result.run_id != run_id:
+            raise ValueError("run_mismatch")
+        authorize_current(uid, oid)
+        return result
+    except HTTPException:
+        raise
+    except httpx.TimeoutException:
+        raise HTTPException(504, "graph_timeout") from None
+    except Exception:
+        raise HTTPException(502, "graph_unavailable") from None

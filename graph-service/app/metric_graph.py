@@ -11,6 +11,7 @@ class MetricGateway(Protocol):
     def candidates(self) -> list[MetricCandidate]: ...
     def plan(self, candidates: list[MetricCandidate]) -> str: ...
     def compile(self, plan: MetricQueryPlan) -> dict: ...
+    def execute(self, plan: MetricQueryPlan) -> dict: ...
 
 
 class MetricState(TypedDict, total=False):
@@ -20,6 +21,7 @@ class MetricState(TypedDict, total=False):
     raw_plan: str
     plan: MetricQueryPlan
     compiled: dict
+    executed: dict
     status: str
     error: str
     metric_id: int | None
@@ -32,6 +34,10 @@ class MetricState(TypedDict, total=False):
     unit: str | None
     sql_fingerprint: str | None
     compiler: str | None
+    columns: list[str]
+    rows: list[dict]
+    row_count: int
+    truncated: bool
 
 
 def _gateway_failure(exc: ModelCallError) -> dict:
@@ -39,7 +45,9 @@ def _gateway_failure(exc: ModelCallError) -> dict:
     return {"status": "rejected" if rejected else "failed", "error": exc.code}
 
 
-def build_metric_graph(gateway: MetricGateway):
+def build_metric_graph(gateway: MetricGateway, execute: bool = False):
+    """Six-node plan graph, or seven nodes when controlled execution is enabled."""
+
     def authorize(_state: MetricState):
         try:
             gateway.authorize()
@@ -78,6 +86,16 @@ def build_metric_graph(gateway: MetricGateway):
         except Exception:
             return {"status": "failed", "error": "metric_compile_failed"}
 
+    def execute_plan(state: MetricState):
+        # SQL never enters this service: the backend recompiles the published
+        # version and returns only the bounded result contract.
+        try:
+            return {"executed": gateway.execute(state["plan"])}
+        except ModelCallError as exc:
+            return _gateway_failure(exc)
+        except Exception:
+            return {"status": "failed", "error": "metric_execution_failed"}
+
     def answer(state: MetricState):
         compiled = state["compiled"]
         plan = state["plan"]
@@ -85,7 +103,7 @@ def build_metric_graph(gateway: MetricGateway):
             item for item in state["candidates"]
             if item.metric_id == plan.metric_id and item.metric_version_id == plan.metric_version_id
         )
-        return {
+        result = {
             "status": "completed",
             "metric_id": compiled.get("metric_id"),
             "metric_code": compiled.get("metric_code"),
@@ -98,6 +116,15 @@ def build_metric_graph(gateway: MetricGateway):
             "sql_fingerprint": compiled.get("sql_fingerprint"),
             "compiler": compiled.get("compiler"),
         }
+        executed = state.get("executed")
+        if executed is not None:
+            result.update({
+                "columns": executed.get("columns") or [],
+                "rows": executed.get("rows") or [],
+                "row_count": executed.get("row_count", 0),
+                "truncated": executed.get("truncated", False),
+            })
+        return result
 
     steps = [
         ("authorize", authorize),
@@ -105,8 +132,10 @@ def build_metric_graph(gateway: MetricGateway):
         ("model_plan", model_plan),
         ("validate_plan", validate_plan),
         ("compile", compile_plan),
-        ("answer", answer),
     ]
+    if execute:
+        steps.append(("execute", execute_plan))
+    steps.append(("answer", answer))
     builder = StateGraph(MetricState)
     for name, node in steps:
         builder.add_node(name, node)

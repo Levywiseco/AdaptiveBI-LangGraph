@@ -12,6 +12,7 @@ from app.contracts import (
     InternalMetricQuestion,
     InternalQuestion,
     MetricPlanResponse,
+    MetricQueryResponse,
     ModelCallError,
     Principal,
     SafeResponse,
@@ -21,6 +22,11 @@ from app.metric_graph import build_metric_graph
 from app.synthetic import SyntheticTools
 
 router = APIRouter()
+
+METRIC_PURPOSE_SCOPES = {
+    "metric-plan": ["metrics:read", "model:invoke", "metric:compile"],
+    "metric-query": ["metrics:read", "model:invoke", "metric:compile", "metric:execute"],
+}
 
 
 def verify(request, body):
@@ -54,7 +60,7 @@ def verify(request, body):
     return claims
 
 
-def verify_metric(request, body):
+def verify_metric(request, body, purposes=frozenset(METRIC_PURPOSE_SCOPES)):
     if os.environ.get("GRAPH_EXPERIMENT_ENABLED", "false").lower() != "true":
         raise HTTPException(404, "experiment_disabled")
     incoming = os.environ.get("BACKEND_TO_GRAPH_TOKEN", "")
@@ -89,9 +95,11 @@ def verify_metric(request, body):
         expected_hash = hashlib.sha256(
             (str(body.datasource_id) + "\n" + body.question).encode()
         ).hexdigest()
+        purpose = claims.get("purpose")
         valid = (
-            claims["purpose"] == "metric-plan"
-            and claims["scope"] == ["metrics:read", "model:invoke", "metric:compile"]
+            purpose in METRIC_PURPOSE_SCOPES
+            and purpose in purposes
+            and claims["scope"] == METRIC_PURPOSE_SCOPES[purpose]
             and claims["run_id"] == str(body.run_id)
             and type(claims["datasource_id"]) is int
             and claims["datasource_id"] == body.datasource_id
@@ -171,6 +179,44 @@ def metric_plan(body: InternalMetricQuestion, request: Request):
         if key in state
     }
     return MetricPlanResponse.model_validate({
+        **public_fields,
+        "run_id": body.run_id,
+        "usage": gateway.usage,
+        "model_calls": gateway.calls,
+        "elapsed_ms": round((perf_counter() - started) * 1000, 2),
+    })
+
+
+@router.post("/internal/v1/metrics/query", response_model=MetricQueryResponse)
+def metric_query(body: InternalMetricQuestion, request: Request):
+    # Only plan-and-execute delegations reach this endpoint.
+    verify_metric(request, body, purposes=frozenset({"metric-query"}))
+    gateway = BusinessGateway(
+        gateway_url=os.environ.get("GRAPH_GATEWAY_URL", "http://127.0.0.1:8000/api/v1"),
+        service_token=os.environ["GRAPH_TO_GATEWAY_TOKEN"],
+        delegation=request.headers["X-Graph-Delegation"],
+        request_body=body.model_dump(mode="json"),
+    )
+    graph = build_metric_graph(gateway, execute=True)
+    started = perf_counter()
+    try:
+        state = graph.invoke(
+            {"question": body.question, "datasource_id": body.datasource_id},
+            {"recursion_limit": 14},
+        )
+    except Exception:
+        state = {"status": "failed", "error": "graph_execution_failed"}
+    public_fields = {
+        key: state.get(key)
+        for key in (
+            "status", "error", "metric_id", "metric_code", "metric_name",
+            "metric_version_id", "metric_version", "dimensions", "time_range",
+            "unit", "sql_fingerprint", "compiler", "columns", "rows",
+            "row_count", "truncated",
+        )
+        if key in state
+    }
+    return MetricQueryResponse.model_validate({
         **public_fields,
         "run_id": body.run_id,
         "usage": gateway.usage,

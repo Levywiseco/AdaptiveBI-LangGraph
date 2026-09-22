@@ -1,5 +1,6 @@
 """Legacy-environment tests: isolated metadata SQLite, no live DB or LLM."""
 import asyncio
+import json
 import time
 from types import SimpleNamespace
 from uuid import uuid4
@@ -8,11 +9,14 @@ import jwt
 import pytest
 from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
-from sqlalchemy import JSON, MetaData
+from sqlalchemy import JSON, MetaData, text
+from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 from sqlmodel import Session, create_engine
 from starlette.requests import Request
 
+from apps.datasource.models.datasource import CoreDatasource
+from apps.datasource.utils.utils import aes_encrypt
 from apps.graph_gateway import api, security, service
 from apps.graph_gateway.contracts import (
     InternalMetricQuestion,
@@ -35,10 +39,13 @@ def configured(monkeypatch):
     from apps.system.models.system_model import AiModelWorkspaceMapping
     # Clone metadata so JSONB can be represented in this test's isolated SQLite only.
     metadata = MetaData()
-    for model in (UserModel, WorkspaceModel, UserWsModel, AiModelDetail, AiModelWorkspaceMapping):
+    for model in (UserModel, WorkspaceModel, UserWsModel, AiModelDetail, AiModelWorkspaceMapping,
+                  CoreDatasource):
         table = model.__table__.to_metadata(metadata)
         if model is UserModel:
             table.c.system_variables.type = JSON()
+        if model is CoreDatasource:
+            table.c.table_relation.type = JSON()
     metadata.create_all(database)
     with Session(database) as session:
         session.add(UserModel(id=7, account="test", oid=2, name="test", email="test@example.invalid", status=1))
@@ -46,6 +53,9 @@ def configured(monkeypatch):
         session.add(UserWsModel(id=1, uid=7, oid=2, weight=0))
         session.add(AiModelDetail(id=10, supplier=1, name="test", model_type=0, base_model="test",
                                   api_domain="https://example.invalid", config="[]", default_model=True, status=1))
+        session.add(CoreDatasource(id=3, name="test-metric-ds", type="pg", status="1",
+                                   configuration=aes_encrypt(json.dumps({"host": "isolated"})).decode(),
+                                   create_by=7, oid=2))
         session.commit()
     monkeypatch.setattr(service, "engine", database)
     yield database
@@ -66,6 +76,18 @@ def body_and_request(changes=None):
 def metric_body_and_request(changes=None):
     body = InternalMetricQuestion(question="八月东部净销售额", datasource_id=3, run_id=uuid4())
     token = security.issue_metric_delegation(7, 2, body.run_id, body.question, body.datasource_id)
+    if changes:
+        claims = jwt.decode(token, settings.GRAPH_DELEGATION_SECRET, algorithms=["HS256"],
+                            options={"verify_aud": False})
+        token = jwt.encode({**claims, **changes}, settings.GRAPH_DELEGATION_SECRET, algorithm="HS256")
+    request = Request({"type": "http", "headers": [(b"x-graph-service", b"b" * 32),
+                                                      (b"x-graph-delegation", token.encode())]})
+    return body, request
+
+
+def metric_query_body_and_request(changes=None):
+    body = InternalMetricQuestion(question="八月东部净销售额", datasource_id=3, run_id=uuid4())
+    token = security.issue_metric_query_delegation(7, 2, body.run_id, body.question, body.datasource_id)
     if changes:
         claims = jwt.decode(token, settings.GRAPH_DELEGATION_SECRET, algorithms=["HS256"],
                             options={"verify_aud": False})
@@ -265,6 +287,132 @@ def test_metric_compile_returns_metadata_without_sql(configured, monkeypatch):
     assert error.value.status_code == 422
 
 
+def install_isolated_sqlite_execution(monkeypatch, tmp_path, regions=250):
+    """Run the real exec_sql path against a temp SQLite file; only the pooled
+    connection layer is redirected, read-only checks and row conversion stay real."""
+    import sqlbot_xpack  # noqa: F401 — legacy import order, see service.execute_authorized_metric_plan
+    import apps.db.db as db_module
+    target = create_engine("sqlite:///" + str(tmp_path / "orders.db").replace("\\", "/"))
+    with target.connect() as conn:
+        conn.execute(text("CREATE TABLE orders (region TEXT, amount INTEGER)"))
+        conn.execute(text("INSERT INTO orders (region, amount) VALUES (:region, :amount)"),
+                     [{"region": f"region-{index}", "amount": index} for index in range(regions)])
+        conn.commit()
+    monkeypatch.setattr(db_module.pool_manager, "get_pool",
+                        lambda ds, **kwargs: sessionmaker(bind=target))
+    state = {"sql": "SELECT region, SUM(amount) AS total FROM orders GROUP BY region"}
+
+    def preview(session, metric_id, payload, oid, current_user):
+        return {
+            "metric_id": metric_id, "metric_code": "net_sales", "metric_name": "Net sales",
+            "metric_version_id": payload.version_id, "metric_version": 3, "datasource_id": 3,
+            "dimensions": payload.dimensions, "applied_filters": [], "time_range": None,
+            "required_tables": ["orders"], "sql": state["sql"],
+            "sql_fingerprint": "a" * 64, "compiler": "metric-plan-v1",
+        }
+
+    monkeypatch.setattr(service, "preview_metric_query_plan", preview)
+    return state
+
+
+def execution_plan(**changes):
+    value = {"metric_id": 9, "metric_version_id": 27, "dimensions": ["region"],
+             "filters": [], "time_range": None, "limit": 300}
+    value.update(changes)
+    return value
+
+
+def test_metric_query_delegation_binds_execute_purpose(configured):
+    body, request = metric_query_body_and_request()
+    claims = security.verify_metric_request(request, body)
+    assert claims["purpose"] == "metric-query"
+    assert claims["scope"] == security.METRIC_QUERY_SCOPES
+    # The execute boundary only accepts the plan-and-execute purpose.
+    plan_body, plan_request = metric_body_and_request()
+    with pytest.raises(HTTPException):
+        security.verify_metric_request(plan_request, plan_body, purposes=frozenset({"metric-query"}))
+    # A query delegation is still valid for shared planning endpoints.
+    assert security.verify_metric_request(request, body)["sub"] == "7"
+
+
+def test_metric_execute_runs_readonly_grouped_query_with_row_cap(
+        configured, monkeypatch, tmp_path):
+    install_isolated_sqlite_execution(monkeypatch, tmp_path)
+    monkeypatch.setattr(settings, "GRAPH_METRIC_MAX_ROWS", 5)
+    result = asyncio.run(service.execute_authorized_metric_plan(
+        {"sub": "7", "workspace": "2", "model_id": 10, "run_id": "run"}, "question", 3,
+        execution_plan(),
+    ))
+    assert result["columns"] == ["region", "total"]
+    assert result["row_count"] == 5 and result["truncated"] is True
+    assert len(result["rows"]) == 5 and result["rows"][0]["region"] == "region-0"
+    assert result["sql_fingerprint"] == "a" * 64
+    assert "sql" not in result and "formula" not in result
+
+
+def test_metric_execute_returns_full_result_under_cap(configured, monkeypatch, tmp_path):
+    state = install_isolated_sqlite_execution(monkeypatch, tmp_path)
+    state["sql"] = ("SELECT region, SUM(amount) AS total FROM orders "
+                    "WHERE region IN ('region-0', 'region-1') GROUP BY region")
+    result = asyncio.run(service.execute_authorized_metric_plan(
+        {"sub": "7", "workspace": "2", "model_id": 10}, "question", 3, execution_plan(),
+    ))
+    assert result["row_count"] == 2 and result["truncated"] is False
+    assert result["rows"][0] == {"region": "region-0", "total": 0}
+
+
+def test_metric_execute_write_sql_is_blocked_by_readonly_guard(configured, monkeypatch, tmp_path):
+    state = install_isolated_sqlite_execution(monkeypatch, tmp_path)
+    state["sql"] = "DELETE FROM orders"
+    with pytest.raises(HTTPException) as error:
+        asyncio.run(service.execute_authorized_metric_plan(
+            {"sub": "7", "workspace": "2", "model_id": 10}, "question", 3, execution_plan(),
+        ))
+    assert error.value.status_code == 502 and error.value.detail == "metric_execution_failed"
+
+
+def test_metric_execute_timeout_surfaces_dedicated_error(configured, monkeypatch, tmp_path):
+    install_isolated_sqlite_execution(monkeypatch, tmp_path)
+    monkeypatch.setattr(settings, "GRAPH_METRIC_EXECUTION_TIMEOUT", 0)
+    with pytest.raises(HTTPException) as error:
+        asyncio.run(service.execute_authorized_metric_plan(
+            {"sub": "7", "workspace": "2", "model_id": 10}, "question", 3, execution_plan(),
+        ))
+    assert error.value.status_code == 504 and error.value.detail == "metric_execution_timeout"
+
+
+@pytest.mark.parametrize("plan", [
+    {"metric_id": 9, "metric_version_id": 27},
+    {"metric_id": "9", "metric_version_id": 27, "dimensions": [], "filters": [],
+     "time_range": None, "limit": 10, "extra": 1},
+    {"metric_id": 9, "metric_version_id": 27, "dimensions": [], "filters": [],
+     "time_range": None, "limit": 999999},
+])
+def test_metric_execute_rejects_invalid_plan_shapes(configured, plan):
+    with pytest.raises(HTTPException) as error:
+        asyncio.run(service.execute_authorized_metric_plan(
+            {"sub": "7", "workspace": "2", "model_id": 10}, "question", 3, plan,
+        ))
+    assert error.value.status_code == 422
+
+
+def test_metric_execute_rejects_foreign_datasource_result(configured, monkeypatch, tmp_path):
+    install_isolated_sqlite_execution(monkeypatch, tmp_path)
+    original = service.preview_metric_query_plan
+
+    def other_workspace_preview(session, metric_id, payload, oid, current_user):
+        compiled = original(session, metric_id, payload, oid, current_user)
+        compiled["datasource_id"] = 99
+        return compiled
+
+    monkeypatch.setattr(service, "preview_metric_query_plan", other_workspace_preview)
+    with pytest.raises(HTTPException) as error:
+        asyncio.run(service.execute_authorized_metric_plan(
+            {"sub": "7", "workspace": "2", "model_id": 10}, "question", 3, execution_plan(),
+        ))
+    assert error.value.status_code == 403
+
+
 @pytest.mark.parametrize("model_name,api_base_url,expected_family,expected_extra_body", [
     ("kimi-k3", "https://api.moonshot.cn/v1", "openai-compatible", None),
     ("qwen-plus", "https://dashscope.aliyuncs.com/compatible-mode/v1",
@@ -313,6 +461,15 @@ def test_internal_routes_have_service_auth_even_with_user_middleware_bypass(conf
         response = client.post(settings.API_V1_STR + "/internal/graph/metrics/" + endpoint,
                                json=metric_body.model_dump(mode="json"))
         assert response.status_code == 401
+    # The execute route also bypasses the user middleware and enforces service
+    # identity plus the plan-and-execute delegation in its own handler.
+    query_body, query_request = metric_query_body_and_request()
+    execute_payload = {**query_body.model_dump(mode="json"), "plan": execution_plan()}
+    assert client.post(settings.API_V1_STR + "/internal/graph/metrics/execute",
+                       json=execute_payload).status_code == 401
+    assert client.post(settings.API_V1_STR + "/internal/graph/metrics/execute",
+                       json=execute_payload,
+                       headers=dict(metric_request.headers)).status_code == 401
     # A valid service identity and delegation reaches current authorization. The
     # candidate store is stubbed because this suite never creates business data.
     monkeypatch.setattr(api, "authorized_metric_candidates", lambda *args: [])
@@ -473,28 +630,88 @@ def test_logged_in_metric_plan_delegates_and_filters_internal_fields(configured,
     assert len(captured) == 1
 
 
+def test_logged_in_metric_query_delegates_and_filters_internal_fields(configured, monkeypatch):
+    import httpx
+    from apps.system.middleware import auth
+    from apps.system.schemas.system_schema import UserInfoDTO
+    from common.core.response_middleware import ResponseMiddleware
+    from datetime import timedelta
+    from common.core.security import create_access_token
+
+    async def user_info(*, session, user_id):
+        user = session.get(UserModel, user_id)
+        return UserInfoDTO.model_validate(user.model_dump()) if user else None
+
+    monkeypatch.setattr(auth, "engine", configured)
+    monkeypatch.setattr(auth, "get_user_info", user_info)
+    captured = []
+
+    async def post(self, url, **kwargs):
+        captured.append(url)
+        body = kwargs["json"]
+        claims = jwt.decode(
+            kwargs["headers"]["X-Graph-Delegation"], settings.GRAPH_DELEGATION_SECRET,
+            algorithms=["HS256"], audience="adaptive-graph",
+        )
+        assert claims["purpose"] == "metric-query" and "metric:execute" in claims["scope"]
+        assert url.endswith("/internal/v1/metrics/query")
+        return httpx.Response(200, request=httpx.Request("POST", url), json={
+            "mode": "metric-query", "run_id": body["run_id"], "status": "completed",
+            "metric_id": 9, "metric_code": "net_sales", "metric_name": "Net sales",
+            "metric_version_id": 27, "metric_version": 3, "dimensions": ["region"],
+            "time_range": None, "unit": "USD", "sql_fingerprint": "a" * 64,
+            "compiler": "metric-plan-v1", "columns": ["region", "net_sales"],
+            "rows": [{"region": "east", "net_sales": 770}], "row_count": 1,
+            "truncated": False, "model_calls": 1,
+            "sql": "SELECT hidden", "formula": "gross-refund", "prompt": "hidden",
+        })
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", post)
+    application = FastAPI()
+    application.include_router(api.router, prefix="/api/v1")
+    application.add_middleware(auth.TokenMiddleware)
+    application.add_middleware(ResponseMiddleware)
+    client = TestClient(application)
+    token = create_access_token({"id": 7}, timedelta(minutes=1))
+    response = client.post(
+        "/api/v1/analysis/metrics/query",
+        json={"question": "August net sales", "datasource_id": 3},
+        headers={settings.TOKEN_KEY: "Bearer " + token},
+    )
+    assert response.status_code == 200
+    data = response.json()["data"]
+    assert data["mode"] == "metric-query" and data["row_count"] == 1
+    assert data["rows"] == [{"region": "east", "net_sales": 770}]
+    assert not {"sql", "formula", "prompt"} & data.keys()
+    assert captured and captured[-1].endswith("/metrics/query")
+
+
 def test_wire_schema_matches_graph_service():
     # Compare source-independent JSON schema contracts in the two dependency environments.
     import json
     from pathlib import Path
     import subprocess
     from apps.graph_gateway.contracts import (
-        MetricPlanResponse, MetricQuestionRequest, QuestionRequest, SafeResponse,
+        MetricPlanResponse, MetricQueryResponse, MetricQuestionRequest, QuestionRequest, SafeResponse,
     )
     root = Path(__file__).resolve().parents[1]
     python = root / "graph-service/.venv/Scripts/python.exe"
     if not python.exists():
         pytest.skip("graph-service environment required for cross-environment schema comparison")
     output = subprocess.check_output([str(python), "-c",
-        "import json; from app.contracts import MetricPlanResponse, MetricQuestionRequest, QuestionRequest, SafeResponse; "
+        "import json; from app.contracts import MetricPlanResponse, MetricQueryResponse, "
+        "MetricQuestionRequest, QuestionRequest, SafeResponse; "
         "print(json.dumps([QuestionRequest.model_json_schema(), SafeResponse.model_json_schema(), "
-        "MetricQuestionRequest.model_json_schema(), MetricPlanResponse.model_json_schema()]))"],
+        "MetricQuestionRequest.model_json_schema(), MetricPlanResponse.model_json_schema(), "
+        "MetricQueryResponse.model_json_schema()]))"],
         cwd=root / "graph-service", text=True)
-    request_schema, response_schema, metric_request_schema, metric_response_schema = json.loads(output)
+    (request_schema, response_schema, metric_request_schema,
+     metric_response_schema, metric_query_response_schema) = json.loads(output)
     assert request_schema["properties"] == QuestionRequest.model_json_schema()["properties"]
     assert response_schema["properties"] == SafeResponse.model_json_schema()["properties"]
     assert metric_request_schema["properties"] == MetricQuestionRequest.model_json_schema()["properties"]
     assert metric_response_schema["properties"] == MetricPlanResponse.model_json_schema()["properties"]
+    assert metric_query_response_schema["properties"] == MetricQueryResponse.model_json_schema()["properties"]
 
 @pytest.fixture
 def http_graph_stack(configured, monkeypatch):
@@ -677,6 +894,60 @@ def test_real_metric_http_roundtrip_with_stub_provider(http_graph_stack, monkeyp
     assert data["status"] == "completed" and data["metric_id"] == 9
     assert data["metric_version_id"] == 27 and data["unit"] == "USD"
     assert data["sql_fingerprint"] == "a" * 64 and data["compiler"] == "metric-plan-v1"
+    assert data["usage"]["total_tokens"] == 30 and data["model_calls"] == 1
+    assert calls == [question]
+    assert not {"sql", "formula", "prompt", "plan", "candidates"} & data.keys()
+
+
+def test_real_metric_query_http_roundtrip_with_stub_provider(http_graph_stack, monkeypatch, tmp_path):
+    """Full plan-and-execute loop over real HTTP; SQL runs on an isolated SQLite file."""
+    import httpx
+    from datetime import timedelta
+    from apps.ai_model.model_factory import LLMConfig
+    from common.core.security import create_access_token
+
+    calls = []
+
+    async def config(model_id):
+        return LLMConfig(model_id=10, model_type="openai", model_name="test")
+
+    class Model:
+        async def ainvoke(self, messages):
+            calls.append(messages[-1].content)
+            return SimpleNamespace(
+                content='{"metric_id":9,"metric_version_id":27,"dimensions":["region"],'
+                        '"filters":[],"time_range":null,"limit":300}',
+                usage_metadata={"input_tokens": 20, "output_tokens": 10, "total_tokens": 30},
+            )
+
+    monkeypatch.setattr(service, "get_default_config", config)
+    monkeypatch.setattr(service.LLMFactory, "create_llm", lambda _: SimpleNamespace(llm=Model()))
+    install_isolated_sqlite_execution(monkeypatch, tmp_path, regions=250)
+    backend_url, graph_url = http_graph_stack
+    token = create_access_token({"id": 7}, timedelta(minutes=1))
+    question = "2026年8月各区域净销售额"
+    with httpx.Client(timeout=45, trust_env=False) as client:
+        # Anonymous and direct graph access cannot reach the execution path.
+        assert client.post(graph_url + "/internal/v1/metrics/query", json={
+            "question": question, "datasource_id": 3, "run_id": str(uuid4()),
+        }).status_code == 401
+        assert client.post(backend_url + "/analysis/metrics/query", json={
+            "question": question, "datasource_id": 3,
+        }).status_code == 401
+        response = client.post(
+            backend_url + "/analysis/metrics/query",
+            json={"question": question, "datasource_id": 3},
+            headers={settings.TOKEN_KEY: "Bearer " + token},
+        )
+    assert response.status_code == 200, response.text
+    data = response.json()["data"]
+    assert data.get("error") is None, data
+    assert data["status"] == "completed" and data["mode"] == "metric-query", data
+    assert data["metric_id"] == 9 and data["metric_version_id"] == 27
+    assert data["columns"] == ["region", "total"]
+    # GRAPH_METRIC_MAX_ROWS defaults to 200, so the 250-region result is capped.
+    assert data["row_count"] == 200 and data["truncated"] is True
+    assert data["rows"][0] == {"region": "region-0", "total": 0}
     assert data["usage"]["total_tokens"] == 30 and data["model_calls"] == 1
     assert calls == [question]
     assert not {"sql", "formula", "prompt", "plan", "candidates"} & data.keys()

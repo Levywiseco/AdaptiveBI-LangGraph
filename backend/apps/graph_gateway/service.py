@@ -7,6 +7,7 @@ from fastapi import HTTPException
 from sqlmodel import Session, select
 
 from apps.ai_model.model_factory import LLMFactory, get_default_config
+from apps.datasource.models.datasource import CoreDatasource
 from apps.system.crud.aimodel_manage import get_ai_model_list_by_workspace
 from apps.system.models.system_model import AiModelDetail, UserWsModel, WorkspaceModel
 from apps.system.models.user import UserModel
@@ -20,6 +21,8 @@ from apps.metrics.service.query_planner import preview_metric_query_plan
 from apps.system.schemas.system_schema import UserInfoDTO
 
 MODEL_SLOTS = asyncio.Semaphore(4)
+EXECUTION_SLOTS = asyncio.Semaphore(4)
+PLAN_KEYS = {"metric_id", "metric_version_id", "dimensions", "filters", "time_range", "limit"}
 SCHEMA = (
     "sales(id INTEGER, month TEXT, region TEXT, gross INTEGER, refund INTEGER); net = gross - refund. "
     "month stores YYYY-MM text, for example '2026-08' (August 2026), not full dates. "
@@ -144,17 +147,15 @@ async def invoke_metric_model(claims, question: str, datasource_id: int, candida
         MODEL_SLOTS.release()
 
 
-def compile_authorized_metric_plan(claims, question: str, datasource_id: int, plan: dict):
-    allowed = {"metric_id", "metric_version_id", "dimensions", "filters", "time_range", "limit"}
-    if not isinstance(plan, dict) or set(plan) != allowed:
+def _validated_plan_request(plan: dict) -> tuple[int, int, MetricQueryPlanRequest]:
+    """Re-validate the graph-service plan shape; the plan is never trusted beyond these keys."""
+    if not isinstance(plan, dict) or set(plan) != PLAN_KEYS:
         raise HTTPException(422, "metric_plan_invalid")
     metric_id = plan.get("metric_id")
     version_id = plan.get("metric_version_id")
     if (type(metric_id) is not int or metric_id <= 0
             or type(version_id) is not int or version_id <= 0):
         raise HTTPException(422, "metric_plan_invalid")
-    uid, oid = int(claims["sub"]), int(claims["workspace"])
-    authorize_current(uid, oid)
     try:
         payload = MetricQueryPlanRequest.model_validate({
             "version_id": version_id,
@@ -165,6 +166,13 @@ def compile_authorized_metric_plan(claims, question: str, datasource_id: int, pl
         })
     except Exception:
         raise HTTPException(422, "metric_plan_invalid") from None
+    return metric_id, version_id, payload
+
+
+def compile_authorized_metric_plan(claims, question: str, datasource_id: int, plan: dict):
+    metric_id, version_id, payload = _validated_plan_request(plan)
+    uid, oid = int(claims["sub"]), int(claims["workspace"])
+    authorize_current(uid, oid)
     with Session(engine) as session:
         current_user = _current_user(session, uid, oid)
         compiled = preview_metric_query_plan(session, metric_id, payload, oid, current_user)
@@ -175,6 +183,74 @@ def compile_authorized_metric_plan(claims, question: str, datasource_id: int, pl
         "metric_id", "metric_code", "metric_name", "metric_version_id", "metric_version",
         "dimensions", "time_range", "sql_fingerprint", "compiler",
     )}
+
+
+async def execute_authorized_metric_plan(claims, question: str, datasource_id: int, plan: dict):
+    """Compile the published version again, then run one read-only bounded query.
+
+    SQL never leaves this process: the graph service only supplies the validated plan.
+    """
+    metric_id, version_id, payload = _validated_plan_request(plan)
+    uid, oid = int(claims["sub"]), int(claims["workspace"])
+    authorize_current(uid, oid)
+    with Session(engine) as session:
+        current_user = _current_user(session, uid, oid)
+        compiled = preview_metric_query_plan(session, metric_id, payload, oid, current_user)
+        datasource = session.get(CoreDatasource, compiled["datasource_id"])
+    # Re-check permissions after compilation; a revoked session stops before execution.
+    authorize_current(uid, oid)
+    if (compiled["datasource_id"] != datasource_id or compiled["metric_version_id"] != version_id
+            or not datasource or datasource.oid != oid):
+        raise HTTPException(403, "metric_not_authorized")
+    try:
+        await asyncio.wait_for(EXECUTION_SLOTS.acquire(), timeout=0.2)
+    except asyncio.TimeoutError:
+        raise HTTPException(503, "gateway_busy") from None
+    started = perf_counter()
+    try:
+        try:
+            # Imported lazily: apps.db.db pulls driver modules and xpack crypto.
+            # main.py loads sqlbot_xpack first in production; keep that order here
+            # so the legacy circular import inside apps.system.crud.assistant resolves.
+            import sqlbot_xpack  # noqa: F401
+            from apps.db.db import exec_sql
+            # exec_sql rejects non-read statements; the worker thread cannot be cancelled
+            # on timeout, so the overrun is logged instead of silently dropped.
+            raw = await asyncio.wait_for(
+                asyncio.to_thread(exec_sql, datasource, compiled["sql"]),
+                timeout=settings.GRAPH_METRIC_EXECUTION_TIMEOUT,
+            )
+        except asyncio.TimeoutError:
+            logging.getLogger("adaptive.graph_gateway").warning(
+                "metric_execution_timeout %s", json.dumps({
+                    "run_id": claims.get("run_id"), "metric_id": metric_id,
+                    "timeout_s": settings.GRAPH_METRIC_EXECUTION_TIMEOUT,
+                    "background_state": "unknown",
+                }))
+            raise HTTPException(504, "metric_execution_timeout") from None
+        except Exception:
+            raise HTTPException(502, "metric_execution_failed") from None
+    finally:
+        EXECUTION_SLOTS.release()
+    rows = raw.get("data") or []
+    max_rows = settings.GRAPH_METRIC_MAX_ROWS
+    truncated = len(rows) > max_rows
+    if truncated:
+        rows = rows[:max_rows]
+    elapsed_ms = round((perf_counter() - started) * 1000, 2)
+    logging.getLogger("adaptive.graph_gateway").info("metric_execution_usage %s", json.dumps({
+        "run_id": claims.get("run_id"), "metric_id": metric_id,
+        "row_count": len(rows), "truncated": truncated, "elapsed_ms": elapsed_ms,
+    }))
+    return {
+        "metric_id": compiled["metric_id"],
+        "sql_fingerprint": compiled["sql_fingerprint"],
+        "columns": raw.get("fields") or [],
+        "rows": rows,
+        "row_count": len(rows),
+        "truncated": truncated,
+        "elapsed_ms": elapsed_ms,
+    }
 
 
 async def invoke_model(claims, question):

@@ -1,7 +1,7 @@
 from typing import Any
 
 import httpx
-from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, SecretStr, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, SecretStr, ValidationError, field_validator
 
 from app.contracts import ModelCallError, ModelUsage
 from app.planning import MetricCandidate, MetricQueryPlan
@@ -19,6 +19,38 @@ class CompiledMetric(BaseModel):
     time_range: dict[str, str] | None = None
     sql_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
     compiler: str = Field(min_length=1, max_length=64)
+
+
+class MetricExecResult(BaseModel):
+    """Execution outcome; SQL, formulas and connection data must never appear here."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    metric_id: int = Field(gt=0)
+    sql_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
+    columns: list[str] = Field(max_length=64)
+    rows: list[dict] = Field(max_length=10000)
+    row_count: int = Field(ge=0)
+    truncated: bool = False
+    elapsed_ms: float = Field(ge=0)
+
+    @field_validator("columns")
+    @classmethod
+    def clean_columns(cls, value):
+        if any(not isinstance(name, str) or not name for name in value):
+            raise ValueError("invalid_columns")
+        return value
+
+    @field_validator("rows")
+    @classmethod
+    def scalar_rows(cls, value):
+        for row in value:
+            if not isinstance(row, dict):
+                raise ValueError("invalid_rows")
+            for cell in row.values():
+                if cell is not None and not isinstance(cell, (str, int, float, bool)):
+                    raise ValueError("invalid_rows")
+        return value
 
 
 class BusinessGateway(BaseModel):
@@ -59,6 +91,11 @@ class BusinessGateway(BaseModel):
                 raise ModelCallError("gateway_rejected")
             if response.status_code == 422 and endpoint.endswith("/compile"):
                 raise ModelCallError("metric_compile_failed")
+            if endpoint.endswith("/execute"):
+                if response.status_code == 504:
+                    raise ModelCallError("metric_execution_timeout")
+                if response.status_code in (422, 502):
+                    raise ModelCallError("metric_execution_failed")
             response.raise_for_status()
             payload = response.json()
             if isinstance(payload, dict) and {"code", "data", "msg"} <= payload.keys():
@@ -130,3 +167,21 @@ class BusinessGateway(BaseModel):
         ):
             raise ModelCallError("metric_compile_failed")
         return compiled.model_dump(mode="json")
+
+    def execute(self, plan: MetricQueryPlan) -> dict:
+        """Run the compiled plan backend-side; only this bounded result crosses back."""
+        payload = self._request(
+            "/internal/graph/metrics/execute",
+            {"plan": plan.model_dump(mode="json")},
+        )
+        try:
+            executed = MetricExecResult.model_validate(payload)
+        except ValidationError:
+            raise ModelCallError("gateway_unavailable") from None
+        if (
+            executed.metric_id != plan.metric_id
+            or executed.row_count != len(executed.rows)
+            or (executed.truncated is False and executed.row_count > 10000)
+        ):
+            raise ModelCallError("gateway_unavailable")
+        return executed.model_dump(mode="json")

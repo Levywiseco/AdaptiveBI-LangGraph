@@ -39,6 +39,7 @@ class TokenMiddleware(BaseHTTPMiddleware):
             settings.API_V1_STR + "/internal/graph/metrics/candidates",
             settings.API_V1_STR + "/internal/graph/metrics/model",
             settings.API_V1_STR + "/internal/graph/metrics/compile",
+            settings.API_V1_STR + "/internal/graph/metrics/execute",
         }:
             return await call_next(request)
         

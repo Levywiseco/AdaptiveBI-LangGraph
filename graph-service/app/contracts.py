@@ -102,6 +102,10 @@ class MetricCompileRequest(InternalMetricQuestion):
     plan: dict
 
 
+class MetricExecuteRequest(InternalMetricQuestion):
+    plan: dict
+
+
 class ModelUsage(BaseModel):
     input_tokens: int | None = Field(default=None, ge=0)
     output_tokens: int | None = Field(default=None, ge=0)
@@ -147,6 +151,38 @@ class MetricPlanResponse(BaseModel):
     error: Literal["metric_not_found", "metric_plan_invalid", "metric_not_authorized",
                    "metric_dimension_not_allowed", "metric_filter_not_allowed",
                    "metric_time_range_not_allowed", "metric_compile_failed",
+                   "model_timeout", "model_call_failed", "model_output_invalid",
+                   "gateway_unavailable", "gateway_rejected", "graph_execution_failed"] | None = None
+    usage: ModelUsage = Field(default_factory=ModelUsage)
+    model_calls: int | None = Field(default=0, ge=0)
+    elapsed_ms: float = Field(default=0, ge=0)
+
+
+class MetricQueryResponse(BaseModel):
+    """Plan-and-execute outcome; execution data is bounded, SQL never returns."""
+
+    model_config = ConfigDict(extra="forbid")
+    mode: Literal["metric-query"] = "metric-query"
+    run_id: UUID
+    status: Literal["completed", "failed", "rejected"]
+    metric_id: int | None = None
+    metric_code: str | None = None
+    metric_name: str | None = None
+    metric_version_id: int | None = None
+    metric_version: int | None = None
+    dimensions: list[str] = Field(default_factory=list)
+    time_range: dict[str, str] | None = None
+    unit: str | None = None
+    sql_fingerprint: str | None = None
+    compiler: str | None = None
+    columns: list[str] = Field(default_factory=list)
+    rows: list[dict] = Field(default_factory=list)
+    row_count: int = Field(default=0, ge=0)
+    truncated: bool = False
+    error: Literal["metric_not_found", "metric_plan_invalid", "metric_not_authorized",
+                   "metric_dimension_not_allowed", "metric_filter_not_allowed",
+                   "metric_time_range_not_allowed", "metric_compile_failed",
+                   "metric_execution_failed", "metric_execution_timeout",
                    "model_timeout", "model_call_failed", "model_output_invalid",
                    "gateway_unavailable", "gateway_rejected", "graph_execution_failed"] | None = None
     usage: ModelUsage = Field(default_factory=ModelUsage)

@@ -9,8 +9,10 @@ from apps.graph_gateway.contracts import (
     InternalMetricQuestion,
     InternalQuestion,
     MetricCompileRequest,
+    MetricExecuteRequest,
     MetricModelRequest,
     MetricPlanResponse,
+    MetricQueryResponse,
     MetricQuestionRequest,
     QuestionRequest,
     SafeResponse,
@@ -19,6 +21,7 @@ from apps.graph_gateway.security import (
     enabled,
     issue_delegation,
     issue_metric_delegation,
+    issue_metric_query_delegation,
     metric_datasource_enabled,
     verify_metric_request,
     verify_request,
@@ -27,6 +30,7 @@ from apps.graph_gateway.service import (
     authorize_current,
     authorized_metric_candidates,
     compile_authorized_metric_plan,
+    execute_authorized_metric_plan,
     invoke_metric_model,
     invoke_model,
 )
@@ -120,6 +124,43 @@ async def metric_plan(body: MetricQuestionRequest, request: Request):
         raise HTTPException(502, "graph_unavailable") from None
 
 
+@router.post("/analysis/metrics/query", response_model=MetricQueryResponse)
+async def metric_query(body: MetricQuestionRequest, request: Request):
+    user = login_user(request)
+    metric_datasource_enabled(body.datasource_id)
+    authorize_current(user.id, user.oid)
+    run_id = uuid4()
+    token = issue_metric_query_delegation(user.id, user.oid, run_id, body.question, body.datasource_id)
+    try:
+        async with httpx.AsyncClient(timeout=45, follow_redirects=False, trust_env=False) as client:
+            response = await client.post(
+                settings.GRAPH_SERVICE_URL.rstrip("/") + "/internal/v1/metrics/query",
+                json={**body.model_dump(), "run_id": str(run_id)},
+                headers={"X-Graph-Service": settings.BACKEND_TO_GRAPH_TOKEN,
+                         "X-Graph-Delegation": token},
+            )
+        response.raise_for_status()
+        payload = response.json()
+        if not isinstance(payload, dict):
+            raise ValueError("invalid_response")
+        # Same allowlist principle as the plan boundary: even if the graph service
+        # leaked SQL, formulas or prompts, they cannot pass this filter.
+        result = MetricQueryResponse.model_validate({
+            key: value for key, value in payload.items()
+            if key in MetricQueryResponse.model_fields
+        })
+        if result.run_id != run_id:
+            raise ValueError("run_mismatch")
+        authorize_current(user.id, user.oid)
+        return result
+    except HTTPException:
+        raise
+    except httpx.TimeoutException:
+        raise HTTPException(504, "graph_timeout") from None
+    except Exception:
+        raise HTTPException(502, "graph_unavailable") from None
+
+
 @router.post("/internal/graph/authorize")
 async def authorize(body: InternalQuestion, request: Request):
     claims = verify_request(request, body)
@@ -160,5 +201,14 @@ async def metric_model(body: MetricModelRequest, request: Request):
 async def metric_compile(body: MetricCompileRequest, request: Request):
     claims = verify_metric_request(request, body)
     return compile_authorized_metric_plan(
+        claims, body.question, body.datasource_id, body.plan
+    )
+
+
+@router.post("/internal/graph/metrics/execute")
+async def metric_execute(body: MetricExecuteRequest, request: Request):
+    # Only the plan-and-execute delegation may trigger customer-database queries.
+    claims = verify_metric_request(request, body, purposes=frozenset({"metric-query"}))
+    return await execute_authorized_metric_plan(
         claims, body.question, body.datasource_id, body.plan
     )

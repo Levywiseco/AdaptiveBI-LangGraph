@@ -18,6 +18,7 @@ from apps.chat.curd.chat import delete_chat_with_user, get_chart_data_with_user,
 from apps.chat.models.chat_model import CreateChat, ChatRecord, RenameChat, ChatQuestion, AxisObj, QuickCommand, \
     ChatInfo, Chat, ChatFinishStep, ChatQuestionBase, SimpleChat, ChatItem
 from apps.chat.task.llm import LLMService
+from apps.graph_gateway.chat_stream import maybe_stream_graph_answer
 from apps.swagger.i18n import PLACEHOLDER_PREFIX
 from apps.system.schemas.permission import SqlbotPermission, require_permissions
 from common.audit.models.log_model import OperationType, OperationModules
@@ -348,6 +349,12 @@ async def stream_sql(session: SessionDep, current_user: CurrentUser, request_que
                      finish_step: ChatFinishStep = ChatFinishStep.GENERATE_CHART, embedding: bool = False,
                      return_img: bool = True):
     try:
+        # Grayscale routing: whitelisted workspaces answer via the LangGraph
+        # metric engine; everything else continues on the legacy flow below.
+        graph_response = await maybe_stream_graph_answer(
+            session, current_user, request_question, in_chat=in_chat)
+        if graph_response is not None:
+            return graph_response
         llm_service = await LLMService.create(session, current_user, request_question, current_assistant,
                                               embedding=embedding)
         llm_service.init_record(session=session)

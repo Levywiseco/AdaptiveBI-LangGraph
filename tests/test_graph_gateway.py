@@ -1,20 +1,23 @@
 """Legacy-environment tests: isolated metadata SQLite, no live DB or LLM."""
 import asyncio
+import datetime
 import json
 import time
 from types import SimpleNamespace
 from uuid import uuid4
 
+import sqlbot_xpack  # noqa: F401 — main.py loads xpack first; keep app import order stable
 import jwt
 import pytest
 from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
-from sqlalchemy import JSON, MetaData, text
+from sqlalchemy import JSON, Integer, MetaData, text
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 from sqlmodel import Session, create_engine
 from starlette.requests import Request
 
+from apps.chat.models.chat_model import Chat, ChatLog, ChatQuestion, ChatRecord
 from apps.datasource.models.datasource import CoreDatasource
 from apps.datasource.utils.utils import aes_encrypt
 from apps.graph_gateway import api, security, service
@@ -22,9 +25,11 @@ from apps.graph_gateway.contracts import (
     InternalMetricQuestion,
     InternalQuestion,
     MetricCandidateRef,
+    MetricQueryResponse,
 )
 from apps.system.models.system_model import AiModelDetail, UserWsModel, WorkspaceModel
 from apps.system.models.user import UserModel
+from apps.system.schemas.system_schema import UserInfoDTO
 from common.core.config import settings
 
 
@@ -40,12 +45,20 @@ def configured(monkeypatch):
     # Clone metadata so JSONB can be represented in this test's isolated SQLite only.
     metadata = MetaData()
     for model in (UserModel, WorkspaceModel, UserWsModel, AiModelDetail, AiModelWorkspaceMapping,
-                  CoreDatasource):
+                  CoreDatasource, Chat, ChatRecord, ChatLog):
         table = model.__table__.to_metadata(metadata)
         if model is UserModel:
             table.c.system_variables.type = JSON()
         if model is CoreDatasource:
             table.c.table_relation.type = JSON()
+        if model is ChatLog:
+            table.c.messages.type = JSON()
+            table.c.token_usage.type = JSON()
+        if model is ChatRecord:
+            # SQLite only autogenerates plain INTEGER primary keys; save_question
+            # relies on the database to assign record ids.
+            table.c.id.identity = None
+            table.c.id.type = Integer()
     metadata.create_all(database)
     with Session(database) as session:
         session.add(UserModel(id=7, account="test", oid=2, name="test", email="test@example.invalid", status=1))
@@ -56,6 +69,8 @@ def configured(monkeypatch):
         session.add(CoreDatasource(id=3, name="test-metric-ds", type="pg", status="1",
                                    configuration=aes_encrypt(json.dumps({"host": "isolated"})).decode(),
                                    create_by=7, oid=2))
+        session.add(Chat(id=1, oid=2, create_by=7, brief=None, chat_type="chat",
+                         datasource=3, engine_type="pg", create_time=datetime.datetime.now()))
         session.commit()
     monkeypatch.setattr(service, "engine", database)
     yield database
@@ -951,3 +966,162 @@ def test_real_metric_query_http_roundtrip_with_stub_provider(http_graph_stack, m
     assert data["usage"]["total_tokens"] == 30 and data["model_calls"] == 1
     assert calls == [question]
     assert not {"sql", "formula", "prompt", "plan", "candidates"} & data.keys()
+
+
+# --- Chat-engine grayscale routing (CHAT_ENGINE=legacy|langgraph) ---
+
+def chat_user(session):
+    user = session.get(UserModel, 7)
+    dto = UserInfoDTO.model_validate(user.model_dump())
+    dto.isAdmin = False
+    return dto
+
+
+def enable_graph_engine(monkeypatch, workspaces="2"):
+    monkeypatch.setattr(settings, "CHAT_ENGINE", "langgraph")
+    monkeypatch.setattr(settings, "CHAT_ENGINE_WORKSPACES", workspaces)
+
+
+def test_chat_engine_routing_gates(configured, monkeypatch):
+    from apps.graph_gateway import chat_stream
+    with Session(configured) as session:
+        user = chat_user(session)
+        chat = session.get(Chat, 1)
+    # Default stays on the legacy engine.
+    assert chat_stream.graph_engine_enabled(user, chat) is False
+    enable_graph_engine(monkeypatch, workspaces="")
+    assert chat_stream.graph_engine_enabled(user, chat) is False
+    enable_graph_engine(monkeypatch)
+    assert chat_stream.graph_engine_enabled(user, chat) is True
+    # Non-whitelisted workspace, unlisted datasource, missing datasource and a
+    # malformed whitelist all fail closed to the legacy engine.
+    assert chat_stream.graph_engine_enabled(user.model_copy(update={"oid": 9}), chat) is False
+    monkeypatch.setattr(settings, "GRAPH_METRIC_DATASOURCES", "4")
+    assert chat_stream.graph_engine_enabled(user, chat) is False
+    monkeypatch.setattr(settings, "GRAPH_METRIC_DATASOURCES", "3")
+    assert chat_stream.graph_engine_enabled(user, chat.model_copy(update={"datasource": None})) is False
+    monkeypatch.setattr(settings, "CHAT_ENGINE_WORKSPACES", "2,not-a-number")
+    assert chat_stream.graph_engine_enabled(user, chat) is False
+    # An unconfigured gateway also stays on legacy.
+    enable_graph_engine(monkeypatch)
+    monkeypatch.setattr(settings, "GRAPH_TO_GATEWAY_TOKEN", "short")
+    assert chat_stream.graph_engine_enabled(user, chat) is False
+
+
+def collect_sse(response):
+    async def read():
+        chunks = [chunk.decode() if isinstance(chunk, bytes) else chunk
+                  async for chunk in response.body_iterator]
+        return "".join(chunks)
+    body = asyncio.run(read())
+    events = []
+    for line in body.split("\n\n"):
+        if line.startswith("data:"):
+            events.append(json.loads(line[len("data:"):]))
+    return body, events
+
+
+def completed_query_result():
+    return MetricQueryResponse(run_id=uuid4(), status="completed", metric_id=9,
+                               metric_code="net_sales", metric_name="净销售额",
+                               metric_version_id=27, metric_version=3,
+                               dimensions=["region"], time_range=None, unit="CNY",
+                               sql_fingerprint="a" * 64, compiler="metric-plan-v1",
+                               columns=["region", "total"],
+                               rows=[{"region": "east", "total": 770}],
+                               row_count=1, truncated=False)
+
+
+def test_graph_chat_stream_emits_legacy_events_and_persists_record(configured, monkeypatch):
+    from apps.graph_gateway import chat_stream
+    enable_graph_engine(monkeypatch)
+    result = completed_query_result()
+
+    async def fake_run(uid, oid, question, datasource_id):
+        assert (uid, oid, datasource_id) == (7, 2, 3)
+        return result
+
+    monkeypatch.setattr(chat_stream, "run_metric_query", fake_run)
+    with Session(configured) as session:
+        user = chat_user(session)
+        response = asyncio.run(chat_stream.maybe_stream_graph_answer(
+            session, user, ChatQuestion(chat_id=1, question="八月东部净销售额")))
+        assert response is not None
+        body, events = collect_sse(response)
+        assert [event["type"] for event in events] == [
+            "id", "question", "datasource", "brief",
+            "sql-result", "info", "sql", "sql-data", "chart", "finish",
+        ]
+        assert events[0]["id"] == 1 and events[1]["question"] == "八月东部净销售额"
+        assert events[2]["id"] == 3 and events[2]["datasource_name"] == "test-metric-ds"
+        assert "net_sales" in body and "SQL指纹" in body
+        # No statement is shipped: the displayed SQL is a governed-query summary.
+        assert "SELECT" not in body.upper() and "secret_formula" not in body
+        chart = json.loads(events[8]["content"])
+        assert chart["type"] == "table"
+        assert chart["columns"] == [{"name": "region", "value": "region"},
+                                    {"name": "total", "value": "total"}]
+        record = session.get(ChatRecord, 1)
+        assert record.finish is True and record.error is None
+        assert record.sql.startswith("-- 受治理指标查询")
+        data = json.loads(record.data)
+        assert data["fields"] == ["region", "total"]
+        assert data["data"] == [{"region": "east", "total": 770}]
+        assert data["fields_info"] == [{"name": "region", "is_numeric": False},
+                                       {"name": "total", "is_numeric": True}]
+        assert session.get(Chat, 1).brief == "八月东部净销售额"
+
+
+def test_graph_chat_stream_maps_rejections_and_does_not_fall_back(configured, monkeypatch):
+    from apps.graph_gateway import chat_stream
+    enable_graph_engine(monkeypatch)
+    result = completed_query_result().model_copy(
+        update={"status": "rejected", "error": "metric_not_found", "rows": [], "row_count": 0})
+
+    async def fake_run(uid, oid, question, datasource_id):
+        return result
+
+    monkeypatch.setattr(chat_stream, "run_metric_query", fake_run)
+    with Session(configured) as session:
+        user = chat_user(session)
+        response = asyncio.run(chat_stream.maybe_stream_graph_answer(
+            session, user, ChatQuestion(chat_id=1, question="任意问题")))
+        _, events = collect_sse(response)
+        assert [event["type"] for event in events] == ["id", "question", "datasource", "error"]
+        assert "未匹配到已发布的指标" in events[3]["content"]
+        record = session.get(ChatRecord, 1)
+        # save_error_message marks errored records finished, matching legacy behavior.
+        assert record.finish is True and "未匹配到已发布的指标" in record.error
+
+
+def test_graph_chat_stream_maps_gateway_outage(configured, monkeypatch):
+    from apps.graph_gateway import chat_stream
+    enable_graph_engine(monkeypatch)
+
+    async def failing_run(uid, oid, question, datasource_id):
+        raise HTTPException(502, "graph_unavailable")
+
+    monkeypatch.setattr(chat_stream, "run_metric_query", failing_run)
+    with Session(configured) as session:
+        user = chat_user(session)
+        response = asyncio.run(chat_stream.maybe_stream_graph_answer(
+            session, user, ChatQuestion(chat_id=1, question="任意问题")))
+        _, events = collect_sse(response)
+        assert events[-1]["type"] == "error"
+        assert "图服务暂不可用" in events[-1]["content"]
+
+
+def test_chat_routing_returns_none_when_not_whitelisted(configured, monkeypatch):
+    from apps.graph_gateway import chat_stream
+    with Session(configured) as session:
+        user = chat_user(session)
+        # Engine disabled by default and non-whitelisted workspace both pass through.
+        assert asyncio.run(chat_stream.maybe_stream_graph_answer(
+            session, user, ChatQuestion(chat_id=1, question="q"))) is None
+        enable_graph_engine(monkeypatch, workspaces="99")
+        assert asyncio.run(chat_stream.maybe_stream_graph_answer(
+            session, user, ChatQuestion(chat_id=1, question="q"))) is None
+        # Non-interactive flows (MCP/embedded) never route to the graph engine.
+        enable_graph_engine(monkeypatch)
+        assert asyncio.run(chat_stream.maybe_stream_graph_answer(
+            session, user, ChatQuestion(chat_id=1, question="q"), in_chat=False)) is None

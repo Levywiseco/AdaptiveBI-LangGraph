@@ -10,6 +10,8 @@ from common.core.config import settings
 ISSUER = "adaptive-backend"
 SCOPES = ["synthetic:query", "model:invoke"]
 METRIC_SCOPES = ["metrics:read", "model:invoke", "metric:compile"]
+METRIC_QUERY_SCOPES = ["metrics:read", "model:invoke", "metric:compile", "metric:execute"]
+METRIC_PURPOSE_SCOPES = {"metric-plan": METRIC_SCOPES, "metric-query": METRIC_QUERY_SCOPES}
 
 
 def enabled():
@@ -48,12 +50,22 @@ def issue_delegation(uid, oid, run_id, question, datasource_id):
 
 
 def issue_metric_delegation(uid, oid, run_id, question, datasource_id):
+    return _issue_metric_delegation(uid, oid, run_id, question, datasource_id,
+                                    purpose="metric-plan", scope=METRIC_SCOPES)
+
+
+def issue_metric_query_delegation(uid, oid, run_id, question, datasource_id):
+    return _issue_metric_delegation(uid, oid, run_id, question, datasource_id,
+                                    purpose="metric-query", scope=METRIC_QUERY_SCOPES)
+
+
+def _issue_metric_delegation(uid, oid, run_id, question, datasource_id, purpose, scope):
     metric_datasource_enabled(datasource_id)
     now = int(time.time())
     return jwt.encode({"iss": ISSUER, "aud": ["adaptive-graph", "adaptive-gateway"],
                        "sub": str(uid), "workspace": str(oid), "run_id": str(run_id),
                        "model_id": settings.GRAPH_MODEL_ID, "datasource_id": datasource_id,
-                       "scope": METRIC_SCOPES, "purpose": "metric-plan",
+                       "scope": scope, "purpose": purpose,
                        "request_hash": fingerprint(question, datasource_id),
                        "iat": now, "exp": now + 120},
                       settings.GRAPH_DELEGATION_SECRET, algorithm="HS256")
@@ -84,7 +96,8 @@ def verify_request(request: Request, body):
     return claims
 
 
-def verify_metric_request(request: Request, body):
+def verify_metric_request(request: Request, body, purposes=frozenset(METRIC_PURPOSE_SCOPES)):
+    """Verify a metric delegation; execution endpoints restrict the accepted purpose."""
     enabled()
     supplied = request.headers.get("X-Graph-Service", "")
     if not hmac.compare_digest(supplied, settings.GRAPH_TO_GATEWAY_TOKEN):
@@ -96,7 +109,9 @@ def verify_metric_request(request: Request, body):
                             audience="adaptive-gateway", issuer=ISSUER,
                             options={"require": ["sub", "workspace", "run_id", "model_id", "scope",
                                                  "purpose", "request_hash", "datasource_id", "iat", "exp"]})
-        valid = (claims["purpose"] == "metric-plan" and claims["scope"] == METRIC_SCOPES
+        purpose = claims.get("purpose")
+        valid = (purpose in METRIC_PURPOSE_SCOPES and purpose in purposes
+                 and claims["scope"] == METRIC_PURPOSE_SCOPES[purpose]
                  and type(claims["datasource_id"]) is int
                  and claims["datasource_id"] == body.datasource_id
                  and claims["run_id"] == str(body.run_id)

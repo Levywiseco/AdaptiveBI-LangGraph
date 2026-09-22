@@ -46,6 +46,8 @@ class Settings(BaseSettings):
     GRAPH_TO_GATEWAY_TOKEN: str = ""
     BACKEND_TO_GRAPH_TOKEN: str = ""
     GRAPH_DELEGATION_SECRET: str = ""
+    GRAPH_METRIC_MAX_ROWS: int = 200
+    GRAPH_METRIC_EXECUTION_TIMEOUT: int = 15
 
     BACKEND_CORS_ORIGINS: Annotated[
         list[AnyUrl] | str, BeforeValidator(parse_cors)

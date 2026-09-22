@@ -2,7 +2,7 @@
 
 以我们当前 Adaptive 项目为基线的独立 LangGraph 重构实验仓库。
 
-**当前状态：已建立独立 LangChain + LangGraph 服务骨架和合成数据测试链路；原网页尚未切换到新引擎。**
+**当前状态：独立图服务、指标计划与受控只读执行闭环已打通（隔离测试数据）；原网页尚未切换到新引擎。**
 
 - [完整迁移方案与架构图](docs/langgraph/MIGRATION_PLAN.md)
 - 基线提交：`55df5be1fb8bef1b2d912e545fecf4f484565d38`
@@ -10,7 +10,8 @@
 - [第一阶段启动与验证](graph-service/README.md)
 - 已有模型适配包含 Kimi、MiniMax 等供应商；新增默认关闭的真实模型网关适配，真实供应商端到端尚未验证。
 - [PR-1 网关契约、独立测试配置与验证边界](docs/langgraph/GATEWAY_CONTRACT.md)
-- /demo/* 继续使用模拟模型；实验问答只查询合成数据，尚未接入旧页面。
+- [PR-2/PR-3 指标计划与受控执行契约](docs/langgraph/METRIC_PLANNING_CONTRACT.md)
+- /demo/* 继续使用模拟模型；实验问答只查询合成数据与隔离测试库，尚未接入旧页面。
 
 本仓库按自己的业务需求推进，不以 SQLBot 原始仓库或官方材料作为后续实现参考。
 已有代码的许可证与版权声明保留，见 [LICENSE](LICENSE)。

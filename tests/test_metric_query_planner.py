@@ -239,7 +239,7 @@ def test_row_permission_filters_are_compiled_into_the_statement_and_fingerprint(
     assert '"adaptive_demo_sales"."region" IN (\'华东\')' in restricted["sql"]
     assert restricted["sql_fingerprint"] != unrestricted["sql_fingerprint"]
     where = parse_one(restricted["sql"], read="postgres").args["where"]
-    # The rule is ANDed with the governed filters instead of replacing them.
+    # The rule is combined with the governed filters instead of replacing them.
     assert "'paid'" in where.sql() and "'华东'" in where.sql()
 
 

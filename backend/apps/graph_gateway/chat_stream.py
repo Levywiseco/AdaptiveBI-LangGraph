@@ -17,7 +17,8 @@ from typing import Any, Optional
 import orjson
 from fastapi import HTTPException
 from fastapi.responses import StreamingResponse
-from sqlmodel import Session
+from sqlalchemy import or_
+from sqlmodel import Session, select
 
 from apps.chat.curd.chat import (
     finish_record,
@@ -28,11 +29,15 @@ from apps.chat.curd.chat import (
     save_sql,
     save_sql_exec_data,
 )
-from apps.chat.models.chat_model import Chat, ChatQuestion, RenameChat
+from apps.chat.models.chat_model import Chat, ChatQuestion, ChatRecord, RenameChat
 from apps.datasource.models.datasource import CoreDatasource
 from apps.graph_gateway.contracts import MetricQueryResponse
-from apps.graph_gateway.security import enabled, metric_datasource_enabled
-from apps.graph_gateway.service import run_metric_query
+from apps.graph_gateway.security import (
+    configured_ids,
+    enabled,
+    metric_datasource_enabled,
+)
+from apps.graph_gateway.service import authorize_current, run_metric_query
 from common.core.config import settings
 
 _ENGINE_ERROR_MESSAGES = {
@@ -53,6 +58,7 @@ _ENGINE_ERROR_MESSAGES = {
     "graph_timeout": "图服务响应超时，请稍后重试",
     "graph_unavailable": "图服务暂不可用，请稍后重试",
     "graph_execution_failed": "图执行失败，请稍后重试",
+    "graph_deadline_exceeded": "问答总耗时超出上限，请稍后重试或缩小查询范围",
 }
 _FALLBACK_ERROR_MESSAGE = "指标查询失败，请稍后重试"
 
@@ -63,24 +69,44 @@ def _engine_error_message(code: Optional[str]) -> str:
 
 def _whitelisted_workspaces() -> Optional[set[int]]:
     try:
-        return {int(value.strip()) for value in settings.CHAT_ENGINE_WORKSPACES.split(",")
-                if value.strip()}
+        return configured_ids(settings.CHAT_ENGINE_WORKSPACES)
     except ValueError:
         # A malformed whitelist fails closed: every chat stays on the legacy engine.
         return None
 
 
 def graph_engine_enabled(current_user, chat: Optional[Chat]) -> bool:
-    """Every gate must pass before one chat question moves to the graph engine."""
+    """Every gate must pass before one chat question moves to the graph engine.
+
+    Routing uses the same authorization the graph run enforces, so a routed
+    question never fails merely because the user is outside the experiment.
+    """
     if settings.CHAT_ENGINE != "langgraph" or chat is None or not chat.datasource:
+        return False
+    workspaces = _whitelisted_workspaces()
+    if workspaces is None or current_user.oid not in workspaces:
+        return False
+    if chat.oid is not None and chat.oid != current_user.oid:
         return False
     try:
         enabled()
         metric_datasource_enabled(chat.datasource)
+        authorize_current(current_user.id, current_user.oid)
     except HTTPException:
         return False
-    workspaces = _whitelisted_workspaces()
-    return workspaces is not None and current_user.oid in workspaces
+    return True
+
+
+def _is_first_question(session: Session, chat_id: int, record_id: int) -> bool:
+    """True when no earlier question exists; the datasource placeholder record is ignored."""
+    earlier = session.exec(
+        select(ChatRecord.id).where(
+            ChatRecord.chat_id == chat_id,
+            ChatRecord.id != record_id,
+            or_(ChatRecord.first_chat.is_(None), ChatRecord.first_chat.is_(False)),
+        ).limit(1)
+    ).first()
+    return earlier is None
 
 
 def _sse(payload: dict[str, Any]) -> str:
@@ -113,13 +139,16 @@ def _governed_summary(result: MetricQueryResponse) -> str:
 
 
 async def maybe_stream_graph_answer(session: Session, current_user, request_question: ChatQuestion,
-                                    in_chat: bool = True):
+                                    in_chat: bool = True, current_assistant: Any = None,
+                                    stream: bool = True):
     """Return a legacy-format SSE response, or None to stay on the legacy engine.
 
+    Only the interactive, streaming web chat is routed: MCP (in_chat=False),
+    embedded assistants and non-streaming callers stay on the legacy engine.
     All persistence happens eagerly while the request session is alive; the
     generator only replays pre-built events.
     """
-    if not in_chat:
+    if not in_chat or current_assistant is not None or not stream:
         return None
     chat = session.get(Chat, request_question.chat_id) if request_question.chat_id else None
     if not graph_engine_enabled(current_user, chat):
@@ -173,7 +202,9 @@ async def maybe_stream_graph_answer(session: Session, current_user, request_ques
     save_sql_exec_data(session=session, record_id=record.id, data=data)
     save_chart(session=session, record_id=record.id, chart=chart)
     brief_source = (request_question.question or "").strip()
-    if brief_source:
+    # Name the chat after its first question only, and leave a model-generated
+    # brief alone, so later questions never overwrite the conversation title.
+    if brief_source and not chat.brief_generate and _is_first_question(session, chat.id, record.id):
         brief = rename_chat(session=session,
                             rename_object=RenameChat(id=chat.id, brief=brief_source[:20],
                                                      brief_generate=False))

@@ -222,3 +222,78 @@ def test_structured_metric_candidates_expose_plan_fields_but_not_formula(monkeyp
         "score": 505,
     }]
     assert "expression" not in candidates[0] and "filters" not in candidates[0]
+
+
+def test_row_permission_filters_are_compiled_into_the_statement_and_fingerprint():
+    metric, version, datasource, catalog = _objects()
+    request = MetricQueryPlanRequest(dimensions=["region"])
+    unrestricted = compile_metric_plan(metric, version, datasource, request, catalog)
+
+    restricted = compile_metric_plan(
+        metric, version, datasource, request, catalog,
+        row_filters=[{"table": "adaptive_demo_sales", "filter": "(\"region\" IN ('华东'))"}],
+    )
+
+    assert unrestricted["row_permission_applied"] is False
+    assert restricted["row_permission_applied"] is True
+    assert '"adaptive_demo_sales"."region" IN (\'华东\')' in restricted["sql"]
+    assert restricted["sql_fingerprint"] != unrestricted["sql_fingerprint"]
+    where = parse_one(restricted["sql"], read="postgres").args["where"]
+    # The rule is ANDed with the governed filters instead of replacing them.
+    assert "'paid'" in where.sql() and "'华东'" in where.sql()
+
+
+@pytest.mark.parametrize("datasource_type,rule,expected", [
+    ("mysql", "(`region` LIKE '%东%')", "`adaptive_demo_sales`.`region` LIKE '%东%'"),
+    ("sqlServer", "([region] IN (N'华东'))", "[adaptive_demo_sales].[region] IN (N'华东')"),
+])
+def test_row_permission_filters_follow_the_datasource_dialect(datasource_type, rule, expected):
+    metric, version, datasource, catalog = _objects()
+    datasource.type = datasource_type
+
+    plan = compile_metric_plan(
+        metric, version, datasource, MetricQueryPlanRequest(), catalog,
+        row_filters=[{"table": "adaptive_demo_sales", "filter": rule}],
+    )
+
+    assert expected in plan["sql"]
+
+
+@pytest.mark.parametrize("rule", [
+    "region IN (SELECT region FROM other_table)",
+    "other_table.region = 'x'",
+    "private.adaptive_demo_sales.region = 'x'",
+    "region = ",
+    "",
+])
+def test_unusable_row_permission_rules_fail_closed(rule):
+    metric, version, datasource, catalog = _objects()
+
+    with pytest.raises(HTTPException) as exc:
+        compile_metric_plan(
+            metric, version, datasource, MetricQueryPlanRequest(), catalog,
+            row_filters=[{"table": "adaptive_demo_sales", "filter": rule}],
+        )
+
+    assert exc.value.status_code == 403
+
+
+def test_row_permission_rule_for_another_table_fails_closed():
+    metric, version, datasource, catalog = _objects()
+
+    with pytest.raises(HTTPException) as exc:
+        compile_metric_plan(
+            metric, version, datasource, MetricQueryPlanRequest(), catalog,
+            row_filters=[{"table": "customers", "filter": "(\"region\" = 'x')"}],
+        )
+
+    assert exc.value.status_code == 403
+
+
+def test_preview_requires_a_current_user_for_permissions():
+    from apps.metrics.service.query_planner import preview_metric_query_plan
+
+    with pytest.raises(HTTPException) as exc:
+        preview_metric_query_plan(None, 9, MetricQueryPlanRequest(), 1, None)
+
+    assert exc.value.status_code == 403

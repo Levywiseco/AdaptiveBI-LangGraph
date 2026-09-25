@@ -209,6 +209,7 @@ class MetricQueryPlanRead(BaseModel):
     applied_filters: list[dict[str, Any]]
     time_range: dict[str, str] | None
     required_tables: list[str]
+    row_permission_applied: bool = False
     sql: str
     sql_fingerprint: str
     compiler: str = "metric-plan-v1"

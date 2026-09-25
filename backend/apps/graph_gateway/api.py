@@ -23,6 +23,7 @@ from apps.graph_gateway.security import (
     issue_metric_delegation,
     issue_metric_query_delegation,
     metric_datasource_enabled,
+    request_budget_seconds,
     verify_metric_request,
     verify_request,
 )
@@ -96,7 +97,8 @@ async def metric_plan(body: MetricQuestionRequest, request: Request):
     run_id = uuid4()
     token = issue_metric_delegation(user.id, user.oid, run_id, body.question, body.datasource_id)
     try:
-        async with httpx.AsyncClient(timeout=45, follow_redirects=False, trust_env=False) as client:
+        async with httpx.AsyncClient(timeout=request_budget_seconds(), follow_redirects=False,
+                                     trust_env=False) as client:
             response = await client.post(
                 settings.GRAPH_SERVICE_URL.rstrip("/") + "/internal/v1/metrics/plan",
                 json={**body.model_dump(), "run_id": str(run_id)},

@@ -23,7 +23,6 @@ from apps.datasource.utils.utils import aes_encrypt
 from apps.graph_gateway import api, security, service
 from apps.graph_gateway.contracts import (
     InternalMetricQuestion,
-    InternalQuestion,
     MetricCandidateRef,
     MetricQueryResponse,
 )
@@ -86,17 +85,6 @@ def configured(monkeypatch):
     database.dispose()
 
 
-def body_and_request(changes=None):
-    body = InternalQuestion(question="七月净销售额", run_id=uuid4())
-    token = security.issue_delegation(7, 2, body.run_id, body.question, body.datasource_id)
-    if changes:
-        claims = jwt.decode(token, settings.GRAPH_DELEGATION_SECRET, algorithms=["HS256"], options={"verify_aud": False})
-        token = jwt.encode({**claims, **changes}, settings.GRAPH_DELEGATION_SECRET, algorithm="HS256")
-    request = Request({"type": "http", "headers": [(b"x-graph-service", b"b" * 32),
-                                                      (b"x-graph-delegation", token.encode())]})
-    return body, request
-
-
 def metric_body_and_request(changes=None):
     body = InternalMetricQuestion(question="八月东部净销售额", datasource_id=3, run_id=uuid4())
     token = security.issue_metric_delegation(7, 2, body.run_id, body.question, body.datasource_id)
@@ -119,13 +107,6 @@ def metric_query_body_and_request(changes=None):
     request = Request({"type": "http", "headers": [(b"x-graph-service", b"b" * 32),
                                                       (b"x-graph-delegation", token.encode())]})
     return body, request
-
-
-def test_signed_binding(configured):
-    body, request = body_and_request()
-    assert security.verify_request(request, body)["sub"] == "7"
-    with pytest.raises(HTTPException):
-        security.verify_request(request, body.model_copy(update={"question": "modified"}))
 
 
 def test_metric_signed_binding_and_datasource_allowlist(configured, monkeypatch):
@@ -151,16 +132,6 @@ def test_invalid_metric_delegation(configured, changes):
     with pytest.raises(HTTPException) as error:
         security.verify_metric_request(request, body)
     assert error.value.status_code in (401, 403)
-
-
-@pytest.mark.parametrize("changes", [{"aud": "other"}, {"scope": []}, {"purpose": "other"},
-                                       {"model_id": 999}, {"exp": 1}, {"run_id": "other"},
-                                       {"exp": int(time.time()) + 5000}])
-def test_invalid_delegation(configured, changes):
-    body, request = body_and_request(changes)
-    with pytest.raises(HTTPException) as error:
-        security.verify_request(request, body)
-    assert error.value.status_code == 401
 
 
 def test_current_authorization_and_revocation(configured):
@@ -225,7 +196,11 @@ def test_model_factory_usage_and_no_session_during_call(configured, monkeypatch)
         return SimpleNamespace(llm=Model())
     monkeypatch.setattr(service, "get_default_config", config)
     monkeypatch.setattr(service.LLMFactory, "create_llm", factory)
-    result = asyncio.run(service.invoke_model({"sub": "7", "workspace": "2", "model_id": 10}, "new question"))
+    monkeypatch.setattr(service, "authorized_metric_candidates", lambda *args: [metric_candidate()])
+    monkeypatch.setattr(service, "planning_dimension_values", lambda *args: {})
+    result = asyncio.run(service.invoke_metric_model(
+        {"sub": "7", "workspace": "2", "model_id": 10, "run_id": "run"}, "new question", 3,
+        [MetricCandidateRef(metric_id=9, metric_version_id=27)]))
     assert result["usage"]["total_tokens"] == 18 and result["model_calls"] == 1
     assert captured[0][-1].content == "new question"
     assert "never-return" not in str(result) and "reasoning" not in str(result)
@@ -466,7 +441,9 @@ def test_gateway_model_provider_policy(model_name, api_base_url, expected_family
 def test_unauthorized_model_never_reaches_factory(configured, monkeypatch):
     monkeypatch.setattr(service.LLMFactory, "create_llm", lambda *_: pytest.fail("unauthorized model invoked"))
     with pytest.raises(HTTPException):
-        asyncio.run(service.invoke_model({"sub": "999", "workspace": "2", "model_id": 10}, "new question"))
+        asyncio.run(service.invoke_metric_model(
+            {"sub": "999", "workspace": "2", "model_id": 10, "run_id": "run"}, "new question", 3,
+            [MetricCandidateRef(metric_id=9, metric_version_id=27)]))
 
 
 def test_internal_routes_have_service_auth_even_with_user_middleware_bypass(configured, monkeypatch):
@@ -475,15 +452,13 @@ def test_internal_routes_have_service_auth_even_with_user_middleware_bypass(conf
     application.include_router(api.router, prefix=settings.API_V1_STR)
     application.add_middleware(TokenMiddleware)
     client = TestClient(application)
-    body, request = body_and_request()
-    for endpoint in ("model", "authorize"):
-        response = client.post(settings.API_V1_STR + "/internal/graph/" + endpoint,
-                               json=body.model_dump(mode="json"))
-        assert response.status_code == 401
-    response = client.post(settings.API_V1_STR + "/internal/graph/authorize",
-                           json=body.model_dump(mode="json"), headers=dict(request.headers))
-    assert response.status_code == 200 and response.json() == {"authorized": True}
     metric_body, metric_request = metric_body_and_request()
+    response = client.post(settings.API_V1_STR + "/internal/graph/metrics/authorize",
+                           json=metric_body.model_dump(mode="json"), headers=dict(metric_request.headers))
+    assert response.status_code == 200 and response.json() == {"authorized": True}
+    # Retired synthetic routes are no longer exempt from the user middleware.
+    for endpoint in ("model", "authorize"):
+        assert client.post(settings.API_V1_STR + "/internal/graph/" + endpoint, json={}).status_code != 200
     for endpoint in ("authorize", "candidates"):
         response = client.post(settings.API_V1_STR + "/internal/graph/metrics/" + endpoint,
                                json=metric_body.model_dump(mode="json"))
@@ -510,9 +485,12 @@ def test_public_query_rejects_missing_user_and_injected_fields(configured):
     application = FastAPI()
     application.include_router(api.router, prefix="/api/v1")
     client = TestClient(application)
-    assert client.post("/api/v1/analysis/query", json={"question": "anything"}).status_code == 401
+    question = {"question": "anything", "datasource_id": 3}
+    assert client.post("/api/v1/analysis/metrics/query", json=question).status_code == 401
+    # The retired synthetic free-SQL endpoint no longer exists.
+    assert client.post("/api/v1/analysis/query", json={"question": "anything"}).status_code == 404
     for field in ("user_id", "oid", "api_key", "sql", "model_url", "Principal"):
-        response = client.post("/api/v1/analysis/query", json={"question": "anything", field: "injected-secret"})
+        response = client.post("/api/v1/analysis/metrics/query", json={**question, field: "injected-secret"})
         assert response.status_code == 422
         assert "injected-secret" not in response.text
 
@@ -536,73 +514,15 @@ def test_provider_errors_and_unknown_usage(configured, monkeypatch, bad_output):
             return SimpleNamespace(content="" if bad_output == "empty" else [], usage_metadata=None)
     monkeypatch.setattr(service, "get_default_config", config)
     monkeypatch.setattr(service.LLMFactory, "create_llm", lambda _: SimpleNamespace(llm=Model()))
-    result = asyncio.run(service.invoke_model({"sub": "7", "workspace": "2", "model_id": 10}, "new question"))
+    monkeypatch.setattr(service, "authorized_metric_candidates", lambda *args: [metric_candidate()])
+    monkeypatch.setattr(service, "planning_dimension_values", lambda *args: {})
+    result = asyncio.run(service.invoke_metric_model(
+        {"sub": "7", "workspace": "2", "model_id": 10, "run_id": "run"}, "new question", 3,
+        [MetricCandidateRef(metric_id=9, metric_version_id=27)]))
     assert result["error"] == ("model_timeout" if bad_output == "timeout" else "model_output_invalid")
     assert result["model_calls"] == 1
     assert result["usage"] == {"input_tokens": None, "output_tokens": None, "total_tokens": None}
     assert "private endpoint" not in str(result)
-
-
-def test_model_prompt_declares_synthetic_dimension_values(configured, monkeypatch):
-    captured = []
-    from apps.ai_model.model_factory import LLMConfig
-
-    async def config(model_id):
-        return LLMConfig(model_id=10, model_type="openai", model_name="test")
-
-    class Model:
-        async def ainvoke(self, messages):
-            captured.extend(messages)
-            return SimpleNamespace(content="SELECT 1", usage_metadata=None)
-
-    monkeypatch.setattr(service, "get_default_config", config)
-    monkeypatch.setattr(service.LLMFactory, "create_llm", lambda _: SimpleNamespace(llm=Model()))
-    result = asyncio.run(service.invoke_model({"sub": "7", "workspace": "2", "model_id": 10}, "东部八月净销售额"))
-    assert result["content"] == "SELECT 1"
-    prompt = captured[0].content
-    assert "YYYY-MM" in prompt and "east" in prompt and "东部" in prompt
-
-
-def test_logged_in_query_delegates_and_filters_response(configured, monkeypatch):
-    import httpx
-    from apps.system.middleware import auth
-    from apps.system.schemas.system_schema import UserInfoDTO
-    from common.core.response_middleware import ResponseMiddleware
-    from datetime import timedelta
-    from common.core.security import create_access_token
-
-    async def user_info(*, session, user_id):
-        user = session.get(UserModel, user_id)
-        return UserInfoDTO.model_validate(user.model_dump()) if user else None
-    monkeypatch.setattr(auth, "engine", configured)
-    monkeypatch.setattr(auth, "get_user_info", user_info)
-    captured = []
-    async def post(self, url, **kwargs):
-        captured.append(kwargs)
-        body = kwargs["json"]
-        claims = jwt.decode(kwargs["headers"]["X-Graph-Delegation"], settings.GRAPH_DELEGATION_SECRET,
-                            algorithms=["HS256"], audience="adaptive-graph")
-        assert claims["sub"] == "7" and claims["workspace"] == "2"
-        return httpx.Response(200, request=httpx.Request("POST", url), json={
-            "run_id": body["run_id"], "status": "completed", "rows": [[1420]], "columns": ["net"],
-            "model_calls": 1, "schema": "hidden", "prompt": "hidden", "api_key": "hidden", "sql": "hidden"})
-    monkeypatch.setattr(httpx.AsyncClient, "post", post)
-    application = FastAPI()
-    application.include_router(api.router, prefix="/api/v1")
-    application.add_middleware(auth.TokenMiddleware)
-    application.add_middleware(ResponseMiddleware)
-    client = TestClient(application)
-    token = create_access_token({"id": 7}, timedelta(minutes=1))
-    response = client.post("/api/v1/analysis/query", json={"question": "not a case id"},
-                           headers={settings.TOKEN_KEY: "Bearer " + token})
-    assert response.status_code == 200
-    data = response.json()["data"]
-    assert data["rows"] == [[1420]]
-    assert not {"schema", "sql", "prompt", "api_key"} & data.keys()
-    unknown = create_access_token({"id": 999}, timedelta(minutes=1))
-    assert client.post("/api/v1/analysis/query", json={"question": "anything"},
-                       headers={settings.TOKEN_KEY: "Bearer " + unknown}).status_code == 401
-    assert len(captured) == 1
 
 
 def test_logged_in_metric_plan_delegates_and_filters_internal_fields(configured, monkeypatch):
@@ -718,9 +638,7 @@ def test_wire_schema_matches_graph_service():
     import json
     from pathlib import Path
     import subprocess
-    from apps.graph_gateway.contracts import (
-        MetricPlanResponse, MetricQueryResponse, MetricQuestionRequest, QuestionRequest, SafeResponse,
-    )
+    from apps.graph_gateway.contracts import MetricPlanResponse, MetricQueryResponse, MetricQuestionRequest
     root = Path(__file__).resolve().parents[1]
     python = root / "graph-service/.venv/Scripts/python.exe"
     if not python.exists():
@@ -729,15 +647,11 @@ def test_wire_schema_matches_graph_service():
         pytest.skip("graph-service environment required for cross-environment schema comparison")
     output = subprocess.check_output([str(python), "-c",
         "import json; from app.contracts import MetricPlanResponse, MetricQueryResponse, "
-        "MetricQuestionRequest, QuestionRequest, SafeResponse; "
-        "print(json.dumps([QuestionRequest.model_json_schema(), SafeResponse.model_json_schema(), "
-        "MetricQuestionRequest.model_json_schema(), MetricPlanResponse.model_json_schema(), "
-        "MetricQueryResponse.model_json_schema()]))"],
+        "MetricQuestionRequest; "
+        "print(json.dumps([MetricQuestionRequest.model_json_schema(), "
+        "MetricPlanResponse.model_json_schema(), MetricQueryResponse.model_json_schema()]))"],
         cwd=root / "graph-service", text=True)
-    (request_schema, response_schema, metric_request_schema,
-     metric_response_schema, metric_query_response_schema) = json.loads(output)
-    assert request_schema["properties"] == QuestionRequest.model_json_schema()["properties"]
-    assert response_schema["properties"] == SafeResponse.model_json_schema()["properties"]
+    metric_request_schema, metric_response_schema, metric_query_response_schema = json.loads(output)
     assert metric_request_schema["properties"] == MetricQuestionRequest.model_json_schema()["properties"]
     assert metric_response_schema["properties"] == MetricPlanResponse.model_json_schema()["properties"]
     assert metric_query_response_schema["properties"] == MetricQueryResponse.model_json_schema()["properties"]
@@ -839,46 +753,6 @@ def http_graph_stack(configured, monkeypatch):
         server.should_exit = True
         thread.join(timeout=5)
         backend_socket.close()
-
-
-@pytest.mark.parametrize("provider_output,expected_status,expected_rows", [
-    ("SELECT SUM(gross-refund) AS net FROM sales WHERE month='2026-08' AND region='east'", "completed", [[770]]),
-    ("DELETE FROM sales", "rejected", []),
-])
-def test_real_http_roundtrip_with_stub_provider(http_graph_stack, monkeypatch,
-                                               provider_output, expected_status, expected_rows):
-    import httpx
-    from datetime import timedelta
-    from apps.ai_model.model_factory import LLMConfig
-    from common.core.security import create_access_token
-    calls = []
-    async def config(model_id):
-        return LLMConfig(model_id=10, model_type="openai", model_name="test")
-    class Model:
-        async def ainvoke(self, messages):
-            calls.append(messages[-1].content)
-            return SimpleNamespace(content=provider_output, usage_metadata=None)
-    monkeypatch.setattr(service, "get_default_config", config)
-    monkeypatch.setattr(service.LLMFactory, "create_llm", lambda _: SimpleNamespace(llm=Model()))
-    backend_url, graph_url = http_graph_stack
-    token = create_access_token({"id": 7}, timedelta(minutes=1))
-    question = "2026年8月东部扣除退款后的销售额是多少？"
-    with httpx.Client(timeout=45, trust_env=False) as client:
-        # Neither a direct graph request nor an anonymous public request can invoke the model.
-        assert client.post(graph_url + "/internal/v1/query", json={
-            "question": question, "run_id": str(uuid4())}).status_code == 401
-        assert client.post(backend_url + "/analysis/query", json={"question": question}).status_code == 401
-        assert calls == []
-        response = client.post(backend_url + "/analysis/query", json={"question": question},
-                               headers={settings.TOKEN_KEY: "Bearer " + token})
-    assert response.status_code == 200
-    data = response.json()["data"]
-    assert data["status"] == expected_status, data
-    assert data["rows"] == expected_rows
-    assert data["model_calls"] == 1 and data["model_config_id"] == 10
-    assert data["usage"] == {"input_tokens": None, "output_tokens": None, "total_tokens": None}
-    assert calls == [question]
-    assert not {"schema", "sql", "prompt", "api_key", "messages"} & data.keys()
 
 
 def test_real_metric_http_roundtrip_with_stub_provider(http_graph_stack, monkeypatch):
@@ -1429,3 +1303,46 @@ def test_graph_chat_sends_earlier_questions_and_shows_clarifications(configured,
         assert clarification["content"] == "需要确认：您想看成交总额还是净销售额？"
         assert "需要确认" in session.get(ChatRecord, 1).error
     assert seen == [[], ["上个月卖了多少钱"], ["上个月卖了多少钱", "净销售额"]]
+
+
+def test_blocking_gateway_work_stays_off_the_event_loop(configured, monkeypatch, tmp_path):
+    import inspect
+    import threading
+    # Database-bound internal handlers are plain functions, run in the threadpool.
+    for handler in (api.metric_authorize, api.metric_candidates, api.metric_compile):
+        assert not inspect.iscoroutinefunction(inspect.unwrap(handler))
+    loop_threads = []
+
+    def slow_candidates(*args):
+        loop_threads.append(threading.current_thread() is threading.main_thread())
+        time.sleep(0.3)
+        return [metric_candidate()]
+
+    monkeypatch.setattr(service, "authorized_metric_candidates", slow_candidates)
+    monkeypatch.setattr(service, "planning_dimension_values", lambda *args: {})
+    monkeypatch.setattr(service.LLMFactory, "create_llm", lambda *_: pytest.fail("not reached"))
+
+    async def scenario():
+        ticks = []
+
+        async def heartbeat():
+            for _ in range(5):
+                ticks.append(time.monotonic())
+                await asyncio.sleep(0.05)
+
+        async def call():
+            async def config(model_id):
+                raise HTTPException(503, "stop after the snapshot")
+            monkeypatch.setattr(service, "get_default_config", config)
+            with pytest.raises(HTTPException):
+                await service.invoke_metric_model(
+                    {"sub": "7", "workspace": "2", "model_id": 10, "run_id": "run"}, "q", 3,
+                    [MetricCandidateRef(metric_id=9, metric_version_id=27)])
+
+        await asyncio.gather(call(), heartbeat())
+        return ticks
+
+    ticks = asyncio.run(scenario())
+    assert loop_threads == [False]
+    # The heartbeat kept ticking while the 0.3 s database snapshot was running.
+    assert len(ticks) == 5 and ticks[-1] - ticks[0] < 0.3

@@ -11,6 +11,7 @@ recommendation and result explanation come with the later streaming work.
 SQL never enters this layer: the displayed "SQL" is a governed-query summary
 with the fingerprint, per the metric contract.
 """
+import asyncio
 import logging
 from typing import Any, Optional
 
@@ -169,7 +170,7 @@ async def maybe_stream_graph_answer(session: Session, current_user, request_ques
     if not in_chat or current_assistant is not None or not stream:
         return None
     chat = session.get(Chat, request_question.chat_id) if request_question.chat_id else None
-    if not graph_engine_enabled(current_user, chat):
+    if not await asyncio.to_thread(graph_engine_enabled, current_user, chat):
         return None
 
     record = save_question(session=session, current_user=current_user, question=request_question)

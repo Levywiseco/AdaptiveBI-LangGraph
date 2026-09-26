@@ -147,3 +147,12 @@
 - **评测**：评测脚本改为直接驱动图服务真实的 LangGraph 流程（后端环境里的 langgraph 0.3 能运行同一份图代码；图服务自己的测试在 1.x 上运行），修复和澄清也被纳入评测。题库扩到 47 题，新增 3 道追问题和 1 道应追问的题。脚本模式：混合召回 44/47，旧精确匹配 42/47；追问题 3/3。用本地模拟的 OpenAI 服务验证了 live 模式下的修复循环（模型持续给出错误指标时，3 次调用后拒绝，用量累加正确）。
 - **暂缓**：checkpoint 持久化 / 取消 / interrupt 恢复（同步运行下收益有限），token 级或进度流式输出（模型输出是 JSON，进度流需要改前端才能验证）。
 - **最新回归**：旧后端 207 passed、3 skipped；图服务 138 passed，20 条合成案例全部通过。
+
+## D包：工程收尾（2026-09-26）
+
+- **下线合成自由 SQL 链路**：删除了唯一一条让模型直接写 SQL 的在线链路，包括后端 `/analysis/query`、`/internal/graph/authorize`、`/internal/graph/model`（以及中间件里对应的豁免路径）、图服务 `/internal/v1/query`、`GatewayChatModel` 和 `live_smoke.py`。仍然有价值的安全测试（伪造服务身份、注入身份字段、默认关闭、调用模型时不持有数据库会话、提供方错误、未授权用户不会走到模型工厂）都迁到了指标链路。离线的 `/demo` 用例与 `evaluate.py` 不连后端，予以保留。
+- **不再阻塞事件循环**：内部接口 authorize、candidates、compile 改为普通函数，由线程池执行；模型和执行入口里的数据库操作、`run_metric_query` 与聊天路由里的授权检查，都改为 `asyncio.to_thread`。新增测试：数据库快照耗时 0.3 秒期间，事件循环仍在按时响应。
+- **授权去重**：去掉同一次调用里重复的检查（模型调用前的重复检查、编译后的重复检查）。保留入口检查、模型调用后检查（调用期间被撤权就不返回结果）、执行前检查。
+- **CI 跑后端测试**：新增 `.github/workflows/backend-tests.yml` 与 `scripts/export-backend-test-requirements.py`。按 lock 导出、保留哈希、剔除 torch；只有 sqlbot-xpack 从 test.pypi 安装，其余都从 PyPI 安装，防止同名包投毒。CI 跑后端全部测试和指标评测的脚本模式。已在本机对 Linux x86_64 做过依赖干跑解析。**推送 workflow 需要 GitHub 令牌带 workflow 权限。**
+- **lint**：`graph_gateway` 里原有的 import 顺序和未使用 import 已清理。
+- **最新回归**：旧后端 196 passed、3 skipped；图服务 121 passed，20 条合成案例全部通过。测试数减少是因为删除了只覆盖下线链路的用例。

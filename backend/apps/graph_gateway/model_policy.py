@@ -6,7 +6,6 @@ from urllib.parse import urlsplit
 
 from apps.ai_model.model_factory import LLMConfig
 
-
 ProviderFamily = Literal["openai-compatible", "qwen-model-studio"]
 
 

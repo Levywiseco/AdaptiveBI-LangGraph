@@ -33,8 +33,6 @@ class TokenMiddleware(BaseHTTPMiddleware):
         # These exact internal routes enforce service + signed delegation auth in
         # their handlers. They must not require an interactive user's login token.
         if request.url.path in {
-            settings.API_V1_STR + "/internal/graph/model",
-            settings.API_V1_STR + "/internal/graph/authorize",
             settings.API_V1_STR + "/internal/graph/metrics/authorize",
             settings.API_V1_STR + "/internal/graph/metrics/candidates",
             settings.API_V1_STR + "/internal/graph/metrics/model",

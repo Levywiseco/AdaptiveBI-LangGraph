@@ -7,25 +7,18 @@ from fastapi.routing import APIRoute
 
 from apps.graph_gateway.contracts import (
     InternalMetricQuestion,
-    InternalQuestion,
     MetricCompileRequest,
     MetricExecuteRequest,
     MetricModelRequest,
     MetricPlanResponse,
     MetricQueryResponse,
     MetricQuestionRequest,
-    QuestionRequest,
-    SafeResponse,
 )
 from apps.graph_gateway.security import (
-    enabled,
-    issue_delegation,
     issue_metric_delegation,
-    issue_metric_query_delegation,
     metric_datasource_enabled,
     request_budget_seconds,
     verify_metric_request,
-    verify_request,
 )
 from apps.graph_gateway.service import (
     authorize_current,
@@ -33,10 +26,10 @@ from apps.graph_gateway.service import (
     compile_authorized_metric_plan,
     execute_authorized_metric_plan,
     invoke_metric_model,
-    invoke_model,
     run_metric_query,
 )
 from common.core.config import settings
+
 
 class SafeValidationRoute(APIRoute):
     def get_route_handler(self):
@@ -60,33 +53,6 @@ def login_user(request: Request):
            (settings.ASSISTANT_TOKEN_KEY, "X-SQLBOT-ASK-TOKEN", "X-SQLBOT-API-KEY")):
         raise HTTPException(403, "login_required")
     return user
-
-
-@router.post("/analysis/query", response_model=SafeResponse)
-async def query(body: QuestionRequest, request: Request):
-    enabled()
-    user = login_user(request)
-    authorize_current(user.id, user.oid)
-    run_id = uuid4()
-    token = issue_delegation(user.id, user.oid, run_id, body.question, body.datasource_id)
-    try:
-        async with httpx.AsyncClient(timeout=45, follow_redirects=False, trust_env=False) as client:
-            response = await client.post(settings.GRAPH_SERVICE_URL.rstrip("/") + "/internal/v1/query",
-                                         json={**body.model_dump(), "run_id": str(run_id)},
-                                         headers={"X-Graph-Service": settings.BACKEND_TO_GRAPH_TOKEN,
-                                                  "X-Graph-Delegation": token})
-        response.raise_for_status()
-        result = SafeResponse.model_validate(response.json())
-        if result.run_id != run_id:
-            raise ValueError("run_mismatch")
-        authorize_current(user.id, user.oid)
-        return result
-    except HTTPException:
-        raise
-    except httpx.TimeoutException:
-        raise HTTPException(504, "graph_timeout") from None
-    except Exception:
-        raise HTTPException(502, "graph_unavailable") from None
 
 
 @router.post("/analysis/metrics/plan", response_model=MetricPlanResponse)
@@ -134,28 +100,17 @@ async def metric_query(body: MetricQuestionRequest, request: Request):
     return await run_metric_query(user.id, user.oid, body.question, body.datasource_id, body.context)
 
 
-@router.post("/internal/graph/authorize")
-async def authorize(body: InternalQuestion, request: Request):
-    claims = verify_request(request, body)
-    authorize_current(int(claims["sub"]), int(claims["workspace"]))
-    return {"authorized": True}
-
-
-@router.post("/internal/graph/model")
-async def model(body: InternalQuestion, request: Request):
-    claims = verify_request(request, body)
-    return await invoke_model(claims, body.question)
-
-
+# Plain ``def`` handlers run in the threadpool: their blocking database work must
+# not stall the event loop that is also awaiting the graph service for the user.
 @router.post("/internal/graph/metrics/authorize")
-async def metric_authorize(body: InternalMetricQuestion, request: Request):
+def metric_authorize(body: InternalMetricQuestion, request: Request):
     claims = verify_metric_request(request, body)
     authorize_current(int(claims["sub"]), int(claims["workspace"]))
     return {"authorized": True}
 
 
 @router.post("/internal/graph/metrics/candidates")
-async def metric_candidates(body: InternalMetricQuestion, request: Request):
+def metric_candidates(body: InternalMetricQuestion, request: Request):
     claims = verify_metric_request(request, body)
     return {"candidates": authorized_metric_candidates(
         claims, body.question, body.datasource_id, body.context
@@ -172,7 +127,7 @@ async def metric_model(body: MetricModelRequest, request: Request):
 
 
 @router.post("/internal/graph/metrics/compile")
-async def metric_compile(body: MetricCompileRequest, request: Request):
+def metric_compile(body: MetricCompileRequest, request: Request):
     claims = verify_metric_request(request, body)
     return compile_authorized_metric_plan(
         claims, body.question, body.datasource_id, body.plan

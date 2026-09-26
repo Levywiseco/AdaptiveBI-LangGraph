@@ -1,5 +1,7 @@
 # PR-1：真实模型网关与任意合成数据问题
 
+> **已下线（2026-09-26，D包）**：本文描述的合成自由 SQL 链路（`/api/v1/analysis/query`、图服务 `/internal/v1/query`、`/internal/graph/authorize` 与 `/internal/graph/model`、`live_smoke.py`）已删除，由受治理的指标链路取代（见 METRIC_PLANNING_CONTRACT.md）。本文仅作历史记录；委托、超时与用量记录的设计仍沿用于指标链路。
+
 日期：2026-09-18。实现基线：437ff82f26285cdf340f76db3e02a1caf2a74a97。
 开始时工作区干净，foundation 的 GitHub PR #1 已合并；远端 main `0c3c0ba5570753814c3eb843435b414687aa3635` 与该基线文件无差异。
 本交付包称 PR-1（执行计划编号），不等于 GitHub 拉取请求编号。

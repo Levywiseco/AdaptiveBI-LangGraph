@@ -418,6 +418,50 @@ def compile_metric_plan(
     }
 
 
+def compile_dimension_sample(
+    version: MetricVersion,
+    datasource: CoreDatasource,
+    catalog: dict[str, set[str]],
+    dimension: str,
+    limit: int,
+) -> str:
+    """Most frequent non-null values of one declared dimension.
+
+    Applies the version's fixed filters so values match what the metric counts.
+    This is system-level sampling without row permissions; callers must not show
+    the values to users whose row rules restrict the metric table.
+    """
+    if len(version.required_tables) != 1:
+        raise _error("Dimension sampling supports exactly one required table")
+    required_table = version.required_tables[0]
+    actual_table = next(
+        (name for name in catalog if name.casefold() == required_table.casefold()),
+        None,
+    )
+    if actual_table is None:
+        raise _error(f"Required table '{required_table}' is unavailable")
+    if not _allowed_version_field(dimension, version.dimensions):
+        raise _error(f"Dimension '{dimension}' is not declared by metric version {version.version}")
+    column = _resolve_column(dimension, catalog)
+    conditions: list[exp.Expression] = [exp.Not(this=exp.Is(this=column.copy(), expression=exp.Null()))]
+    for payload in version.filters:
+        condition, _normalized = _compile_filter(payload, catalog)
+        conditions.append(condition)
+    combined = conditions[0]
+    for condition in conditions[1:]:
+        combined = exp.and_(combined, condition)
+    query = (
+        exp.Select(expressions=[column.copy()])
+        .from_(exp.table_(actual_table, quoted=True))
+        .where(combined)
+        .group_by(column.copy())
+        .order_by(exp.Ordered(this=exp.Count(this=exp.Star()), desc=True))
+        .limit(limit)
+    )
+    dialect = SQLGLOT_DIALECTS.get(datasource.type.casefold()) if datasource.type else None
+    return query.sql(dialect=dialect)
+
+
 def _row_permission_filters(
     session: Session,
     current_user: Any,

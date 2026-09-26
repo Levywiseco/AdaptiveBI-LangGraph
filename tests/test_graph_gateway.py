@@ -41,12 +41,21 @@ def configured(monkeypatch):
                        "GRAPH_METRIC_DATASOURCES": "3"}.items():
         monkeypatch.setattr(settings, key, value)
     database = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
+    from sqlalchemy.dialects.postgresql import JSONB
+    from sqlbot_xpack.permissions.models.ds_permission import DsPermission
+    from sqlbot_xpack.permissions.models.ds_rules import DsRules
+    from apps.datasource.models.datasource import CoreField, CoreTable
+    from apps.metrics.models.metric import MetricDefinition, MetricDimensionValue, MetricVersion
     from apps.system.models.system_model import AiModelWorkspaceMapping
     # Clone metadata so JSONB can be represented in this test's isolated SQLite only.
     metadata = MetaData()
     for model in (UserModel, WorkspaceModel, UserWsModel, AiModelDetail, AiModelWorkspaceMapping,
-                  CoreDatasource, Chat, ChatRecord, ChatLog):
+                  CoreDatasource, Chat, ChatRecord, ChatLog, MetricDefinition, MetricVersion,
+                  MetricDimensionValue, CoreTable, CoreField, DsPermission, DsRules):
         table = model.__table__.to_metadata(metadata)
+        for column in table.columns:
+            if isinstance(column.type, JSONB):
+                column.type = JSON()
         if model is UserModel:
             table.c.system_variables.type = JSON()
         if model is CoreDatasource:
@@ -54,9 +63,9 @@ def configured(monkeypatch):
         if model is ChatLog:
             table.c.messages.type = JSON()
             table.c.token_usage.type = JSON()
-        if model is ChatRecord:
+        if model in (ChatRecord, MetricDimensionValue):
             # SQLite only autogenerates plain INTEGER primary keys; save_question
-            # relies on the database to assign record ids.
+            # and dimension sampling rely on the database to assign ids.
             table.c.id.identity = None
             table.c.id.type = Integer()
     metadata.create_all(database)
@@ -1136,20 +1145,8 @@ def test_chat_routing_returns_none_when_not_whitelisted(configured, monkeypatch)
 
 def install_metric_catalog(database):
     """Published metric + table catalog in the isolated metadata database."""
-    from sqlalchemy.dialects.postgresql import JSONB
-    from sqlbot_xpack.permissions.models.ds_permission import DsPermission
-    from sqlbot_xpack.permissions.models.ds_rules import DsRules
     from apps.datasource.models.datasource import CoreField, CoreTable
     from apps.metrics.models.metric import MetricDefinition, MetricVersion
-    metadata = MetaData()
-    # core_datasource already exists; it is listed so the metric foreign key resolves.
-    for model in (CoreDatasource, MetricDefinition, MetricVersion, CoreTable, CoreField,
-                  DsPermission, DsRules):
-        table = model.__table__.to_metadata(metadata)
-        for column in table.columns:
-            if isinstance(column.type, JSONB):
-                column.type = JSON()
-    metadata.create_all(database)
     with Session(database) as session:
         session.add(MetricDefinition(id=9, oid=2, code="net_sales", name="Net sales",
                                      datasource_id=3, owner_user_id=7, status="published",
@@ -1213,7 +1210,8 @@ def test_metric_delegation_carries_a_deadline_inside_its_lifetime(configured, mo
     body, request = metric_query_body_and_request()
     claims = security.verify_metric_request(request, body)
     assert claims["iat"] < claims["deadline"] <= claims["exp"]
-    assert 50 < claims["deadline"] - time.time() <= 58
+    # The deadline is rounded to milliseconds, so allow that much above the budget.
+    assert 50 < claims["deadline"] - time.time() <= 58.001
     # Oversized budgets are clamped inside the 120-second delegation lifetime.
     monkeypatch.setattr(settings, "GRAPH_REQUEST_TIMEOUT", 999)
     assert security.request_budget_seconds() == security.MAX_REQUEST_BUDGET_SECONDS

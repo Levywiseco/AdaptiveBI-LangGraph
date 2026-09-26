@@ -126,3 +126,44 @@ class MetricVersion(SQLModel, table=True):
         sa_column=Column(DateTime(timezone=False), nullable=True),
     )
     review_note: Optional[str] = Field(default=None, sa_column=Column(Text, nullable=True))
+
+
+class MetricDimensionValue(SQLModel, table=True):
+    """Known values of one dimension of a published metric version.
+
+    Kept outside ``metric_version`` so published calculation rules stay immutable
+    while this derived metadata can be refreshed. ``values`` holds
+    ``{"value": ..., "label": ...}`` entries; ``source="manual"`` rows are
+    administrator-maintained and never overwritten by sampling.
+    """
+
+    __tablename__ = "metric_dimension_value"
+    __table_args__ = (
+        UniqueConstraint("metric_version_id", "dimension", name="uq_metric_dimension_value"),
+    )
+
+    id: Optional[int] = Field(
+        default=None,
+        sa_column=Column(BigInteger, Identity(always=True), primary_key=True),
+    )
+    metric_version_id: int = Field(
+        sa_column=Column(
+            BigInteger,
+            ForeignKey("metric_version.id", ondelete="CASCADE"),
+            nullable=False,
+            index=True,
+        )
+    )
+    dimension: str = Field(max_length=255, nullable=False)
+    values: list[dict[str, Any]] = Field(
+        default_factory=list,
+        sa_column=Column(JSONB, nullable=False, default=list),
+    )
+    # ok | high_cardinality | failed
+    status: str = Field(default="ok", max_length=32, nullable=False)
+    source: str = Field(default="sampled", max_length=32, nullable=False)
+    updated_by: Optional[int] = Field(default=None, sa_column=Column(BigInteger, nullable=True))
+    updated_at: datetime = Field(
+        default_factory=datetime.now,
+        sa_column=Column(DateTime(timezone=False), nullable=False),
+    )

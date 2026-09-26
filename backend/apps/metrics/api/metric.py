@@ -15,10 +15,19 @@ from apps.metrics.crud.metric import (
 from apps.metrics.schemas.metric import (
     MetricCreate,
     MetricDefinitionUpdate,
+    MetricDimensionValueRead,
+    MetricDimensionValuesUpdate,
     MetricPublish,
     MetricQueryPlanRead,
     MetricQueryPlanRequest,
     MetricVersionCreate,
+)
+from apps.metrics.service.dimension_values import (
+    clear_manual_dimension_values,
+    list_dimension_values,
+    refresh_dimension_values,
+    schedule_dimension_sampling,
+    set_manual_dimension_values,
 )
 from apps.metrics.service.query_planner import preview_metric_query_plan
 from apps.system.schemas.permission import SqlbotPermission, require_permissions
@@ -109,7 +118,7 @@ async def publish(
     version_id: int,
     payload: MetricPublish,
 ):
-    return publish_metric_version(
+    result = publish_metric_version(
         session,
         metric_id,
         version_id,
@@ -117,6 +126,72 @@ async def publish(
         current_user.oid,
         current_user.id,
     )
+    # Commit before the background sampler reads the newly published version.
+    session.commit()
+    schedule_dimension_sampling(version_id, current_user.id)
+    return result
+
+
+@router.get(
+    "/{metric_id}/versions/{version_id}/dimension-values",
+    response_model=list[MetricDimensionValueRead],
+)
+@require_permissions(permission=SqlbotPermission(role=["ws_admin"]))
+async def dimension_values(
+    session: SessionDep,
+    current_user: CurrentUser,
+    metric_id: int,
+    version_id: int,
+):
+    return list_dimension_values(session, metric_id, version_id, current_user.oid)
+
+
+@router.post(
+    "/{metric_id}/versions/{version_id}/dimension-values/refresh",
+    response_model=list[MetricDimensionValueRead],
+)
+@require_permissions(permission=SqlbotPermission(role=["ws_admin"]))
+async def refresh_values(
+    session: SessionDep,
+    current_user: CurrentUser,
+    metric_id: int,
+    version_id: int,
+):
+    return await refresh_dimension_values(
+        session, metric_id, version_id, current_user.oid, current_user.id
+    )
+
+
+@router.put(
+    "/{metric_id}/versions/{version_id}/dimension-values/{dimension}",
+    response_model=MetricDimensionValueRead,
+)
+@require_permissions(permission=SqlbotPermission(role=["ws_admin"]))
+async def set_values(
+    session: SessionDep,
+    current_user: CurrentUser,
+    metric_id: int,
+    version_id: int,
+    dimension: str,
+    payload: MetricDimensionValuesUpdate,
+):
+    return set_manual_dimension_values(
+        session, metric_id, version_id, dimension,
+        [item.model_dump() for item in payload.values], current_user.oid, current_user.id,
+    )
+
+
+@router.delete("/{metric_id}/versions/{version_id}/dimension-values/{dimension}")
+@require_permissions(permission=SqlbotPermission(role=["ws_admin"]))
+async def clear_values(
+    session: SessionDep,
+    current_user: CurrentUser,
+    metric_id: int,
+    version_id: int,
+    dimension: str,
+):
+    clear_manual_dimension_values(session, metric_id, version_id, dimension, current_user.oid)
+    return {"cleared": True}
 
 
 @router.delete("/{metric_id}")

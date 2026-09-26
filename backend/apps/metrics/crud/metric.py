@@ -557,8 +557,16 @@ def restore_metric(session: Session, metric_id: int, oid: Optional[int]) -> dict
     return _serialize_metric(session, metric, include_versions=True)
 
 
-def _match_score(question: str, metric: MetricDefinition) -> int:
+def _bigrams(text: str) -> set[str]:
+    chars = [char for char in text.casefold() if not char.isspace()]
+    return {left + right for left, right in zip(chars, chars[1:])}
+
+
+def _match_score(question: str, metric: MetricDefinition, fuzzy: bool = False) -> int:
+    """Lexical relevance. ``fuzzy`` adds Chinese character-bigram overlap, which
+    whitespace tokens cannot provide (e.g. 下单客户数 vs 下单的客户有多少)."""
     normalized_question = question.casefold().strip()
+    question_grams = _bigrams(normalized_question) if fuzzy else set()
     score = 0
     for position, term in enumerate([metric.name, metric.code, *metric.aliases]):
         normalized_term = term.casefold().strip()
@@ -574,6 +582,11 @@ def _match_score(question: str, metric: MetricDefinition) -> int:
             question_tokens = set(normalized_question.replace("_", " ").split())
             term_tokens = set(normalized_term.replace("_", " ").split())
             candidate = 25 * len(question_tokens & term_tokens) - position
+            term_grams = _bigrams(normalized_term) if fuzzy else set()
+            if term_grams:
+                coverage = len(term_grams & question_grams) / len(term_grams)
+                if coverage >= 0.5:
+                    candidate = max(candidate, 50 + round(40 * coverage) - position)
         score = max(score, candidate)
     return score
 
@@ -652,7 +665,10 @@ def _rank_published_metrics(
     datasource_id: Optional[int],
     limit: int,
     current_user: Any,
+    hybrid: bool = False,
 ) -> list[tuple[int, MetricDefinition, MetricVersion]]:
+    """Rank visible published metrics. ``hybrid`` (governed planning only) adds
+    character-bigram and embedding recall; the legacy SQL prompt keeps its behavior."""
     if not datasource_id or not question.strip():
         return []
     now = _now()
@@ -672,16 +688,31 @@ def _rank_published_metrics(
     ).all()
     datasource = session.get(CoreDatasource, datasource_id)
     visible_fields = _visible_fields_for_user(session, datasource_id, current_user)
+    visible = [
+        (metric, version)
+        for metric, version in rows
+        if _metric_version_visible(
+            version,
+            visible_fields,
+            datasource.type if datasource else None,
+        )
+    ]
+    similarities: dict[int, float] = {}
+    if hybrid:
+        from apps.metrics.service.recall import vector_score, vector_similarities
+
+        similarities = {
+            version_id: vector_score(similarity)
+            for version_id, similarity in vector_similarities(question, visible).items()
+        }
     return sorted(
         (
             (score, metric, version)
-            for metric, version in rows
-            if _metric_version_visible(
-                version,
-                visible_fields,
-                datasource.type if datasource else None,
-            )
-            and (score := _match_score(question, metric)) > 0
+            for metric, version in visible
+            if (score := max(
+                _match_score(question, metric, fuzzy=hybrid),
+                similarities.get(int(version.id), 0),
+            )) > 0
         ),
         key=lambda item: (-item[0], item[1].code),
     )[:min(max(limit, 1), 20)]
@@ -694,10 +725,14 @@ def get_metric_candidates(
     datasource_id: Optional[int],
     limit: int = 5,
     current_user: Any = None,
+    hybrid: bool = True,
 ) -> list[dict[str, Any]]:
-    """Return safe structured candidates for governed model planning."""
+    """Return safe structured candidates for governed model planning.
+
+    ``hybrid=False`` reproduces the legacy exact-match recall (evaluation baseline).
+    """
     ranked = _rank_published_metrics(
-        session, question, oid, datasource_id, limit, current_user
+        session, question, oid, datasource_id, limit, current_user, hybrid=hybrid
     )
     return [
         {

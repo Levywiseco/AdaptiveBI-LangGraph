@@ -53,6 +53,13 @@ class Settings(BaseSettings):
     GRAPH_REQUEST_TIMEOUT: int = 60
     # "Today" for resolving relative periods such as 上个月 in metric planning.
     GRAPH_PLANNING_TIMEZONE: str = "Asia/Shanghai"
+    # Embedding recall for governed metric candidates (needs EMBEDDING_ENABLED).
+    GRAPH_METRIC_VECTOR_MIN_SIMILARITY: float = 0.5
+    # Known dimension values for metric planning; more distinct values than the
+    # limit are treated as high-cardinality and not listed. Automatic sampling
+    # (after publish / first planning use) also requires GRAPH_EXPERIMENT_ENABLED.
+    GRAPH_DIMENSION_VALUE_LIMIT: int = 50
+    GRAPH_DIMENSION_SAMPLING_ENABLED: bool = True
     CHAT_ENGINE: Literal["legacy", "langgraph"] = "legacy"
     CHAT_ENGINE_WORKSPACES: str = ""
 

@@ -12,7 +12,11 @@
 | `PUT /system/metrics/{id}` | 修改定义元数据 | 工作空间管理员 |
 | `POST /system/metrics/{id}/versions` | 从新内容创建下一草稿版本 | 工作空间管理员 |
 | `POST /system/metrics/{id}/versions/{version_id}/publish` | 校验并发布指定版本 | 工作空间管理员 |
-| `POST /system/metrics/{id}/query-plan/preview` | 按精确版本编译受约束的单表只读 SQL | 工作空间管理员 |
+| `POST /system/metrics/{id}/query-plan/preview` | 按精确版本编译受约束的单表只读 SQL（非管理员套用行权限，结果含 `row_permission_applied`） | 工作空间管理员 |
+| `GET /system/metrics/{id}/versions/{version_id}/dimension-values` | 查看版本各维度的已知取值、状态与来源 | 工作空间管理员 |
+| `POST /system/metrics/{id}/versions/{version_id}/dimension-values/refresh` | 立即从数据源抽样取值（保留手工维护的维度） | 工作空间管理员 |
+| `PUT /system/metrics/{id}/versions/{version_id}/dimension-values/{dimension}` | 手工维护取值与业务名称，如 `{"values": [{"value": "online", "label": "线上"}]}` | 工作空间管理员 |
+| `DELETE /system/metrics/{id}/versions/{version_id}/dimension-values/{dimension}` | 删除手工取值，恢复抽样 | 工作空间管理员 |
 | `DELETE /system/metrics/{id}` | 归档指标 | 工作空间管理员 |
 | `POST /system/metrics/{id}/restore` | 恢复归档指标 | 工作空间管理员 |
 

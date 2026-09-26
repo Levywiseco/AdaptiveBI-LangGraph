@@ -2,7 +2,7 @@ import re
 from datetime import datetime
 from typing import Any, Literal, Optional
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, StrictFloat, StrictInt, StrictStr, field_validator, model_validator
 
 Aggregation = Literal["SUM", "COUNT", "COUNT_DISTINCT", "AVG", "MIN", "MAX", "CUSTOM"]
 MetricFilterOperator = Literal[
@@ -253,3 +253,38 @@ class MetricRead(BaseModel):
     has_draft: bool = False
     created_at: datetime
     updated_at: datetime
+
+
+class MetricDimensionValueItem(BaseModel):
+    """One stored value; ``label`` is the business name the planner may see in questions."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    value: StrictStr | StrictInt | StrictFloat
+    label: str | None = Field(default=None, max_length=64)
+
+    @field_validator("value")
+    @classmethod
+    def bounded_value(cls, value):
+        if isinstance(value, str) and not (0 < len(value) <= 64):
+            raise ValueError("value must contain 1 to 64 characters")
+        return value
+
+    @field_validator("label")
+    @classmethod
+    def blank_label_is_none(cls, value: str | None) -> str | None:
+        return value.strip() or None if value is not None else None
+
+
+class MetricDimensionValuesUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    values: list[MetricDimensionValueItem] = Field(min_length=1, max_length=200)
+
+
+class MetricDimensionValueRead(BaseModel):
+    dimension: str
+    values: list[dict[str, Any]]
+    status: str
+    source: str
+    updated_at: datetime | None = None

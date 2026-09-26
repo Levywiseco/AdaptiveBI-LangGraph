@@ -25,6 +25,9 @@ Rules:
 3. filters: [] or objects {{"field": ..., "operator": ..., "value": ...}}. field must be one of the
    candidate's dimensions or its time_field. operator is one of =, !=, >, >=, <, <=, in, not_in,
    between, like, not_like, is_null, is_not_null. in/not_in take a JSON array; between takes [low, high].
+   When the candidate lists "dimension_values" for that field, every filter value must be copied exactly
+   from that list. An entry {{"value": ..., "label": ...}} means the question may use the label
+   (for example a Chinese business name) but the filter must use the value.
 4. time_range: null when the question has no time constraint. Otherwise {{"start": ..., "end": ...}}
    applied to the candidate's time_field; a candidate whose time_field is null cannot take a time_range.
    - Use ISO 8601 local datetimes without a timezone offset, e.g. "2026-08-01T00:00:00".

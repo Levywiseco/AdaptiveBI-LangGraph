@@ -28,6 +28,7 @@ from apps.graph_gateway.model_policy import gateway_model_config
 from apps.graph_gateway.prompts import metric_planning_messages, planning_now
 from apps.metrics.crud.metric import get_metric_candidates
 from apps.metrics.schemas.metric import MetricQueryPlanRequest
+from apps.metrics.service.dimension_values import planning_dimension_values
 from apps.metrics.service.query_planner import preview_metric_query_plan
 from apps.system.schemas.system_schema import UserInfoDTO
 
@@ -126,7 +127,16 @@ async def invoke_metric_model(claims, question: str, datasource_id: int, candida
     if not selected or len(selected) != len(requested):
         raise HTTPException(403, "metric_not_authorized")
     uid, oid = int(claims["sub"]), int(claims["workspace"])
-    messages = metric_planning_messages(question, selected, planning_now())
+    with Session(engine) as session:
+        known_values = planning_dimension_values(
+            session, selected, _current_user(session, uid, oid), datasource_id
+        )
+    prompt_candidates = [
+        {**item, "dimension_values": known_values[item["metric_version_id"]]}
+        if item["metric_version_id"] in known_values else item
+        for item in selected
+    ]
+    messages = metric_planning_messages(question, prompt_candidates, planning_now())
     step_timeout(claims, MODEL_STEP_SECONDS)  # refuse to start a call that cannot finish
     try:
         await asyncio.wait_for(MODEL_SLOTS.acquire(), timeout=0.2)

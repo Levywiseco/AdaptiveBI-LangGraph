@@ -80,3 +80,23 @@ def test_live_mode_stops_after_repeated_model_errors(monkeypatch):
         metric_eval.evaluate("live")
     assert "3 consecutive model errors (ProviderError (HTTP 401))" in str(stop.value)
     assert len(calls) == 3
+
+
+def test_runner_drives_the_real_graph_through_a_repair():
+    env = metric_eval.build_environment()
+    document = metric_eval.yaml.safe_load(catalog.CASES_FILE.read_text(encoding="utf-8"))
+    case = next(item for item in document["cases"] if item["id"] == "dim-region")
+    gold = metric_eval.scripted_planner(env)
+    replies = []
+
+    def flaky(messages, current):
+        # First reply names an undeclared dimension; the repair prompt explains why.
+        replies.append(messages)
+        if len(replies) == 1:
+            content, usage = gold(messages, current)
+            return content.replace('"region"', '"customer_id"'), usage
+        return gold(messages, current)
+
+    result = metric_eval.run_case(env, case, flaky, metric_eval.datetime(2026, 9, 25, 10), True, 0.01)
+    assert result["passed"] and result["repairs"] == 1 and result["model_calls"] == 2
+    assert "metric_dimension_not_allowed" in replies[1][-1].content

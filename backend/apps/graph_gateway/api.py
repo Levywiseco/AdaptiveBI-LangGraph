@@ -95,7 +95,8 @@ async def metric_plan(body: MetricQuestionRequest, request: Request):
     metric_datasource_enabled(body.datasource_id)
     authorize_current(user.id, user.oid)
     run_id = uuid4()
-    token = issue_metric_delegation(user.id, user.oid, run_id, body.question, body.datasource_id)
+    token = issue_metric_delegation(user.id, user.oid, run_id, body.question, body.datasource_id,
+                                    body.context)
     try:
         async with httpx.AsyncClient(timeout=request_budget_seconds(), follow_redirects=False,
                                      trust_env=False) as client:
@@ -130,7 +131,7 @@ async def metric_plan(body: MetricQuestionRequest, request: Request):
 @router.post("/analysis/metrics/query", response_model=MetricQueryResponse)
 async def metric_query(body: MetricQuestionRequest, request: Request):
     user = login_user(request)
-    return await run_metric_query(user.id, user.oid, body.question, body.datasource_id)
+    return await run_metric_query(user.id, user.oid, body.question, body.datasource_id, body.context)
 
 
 @router.post("/internal/graph/authorize")
@@ -157,7 +158,7 @@ async def metric_authorize(body: InternalMetricQuestion, request: Request):
 async def metric_candidates(body: InternalMetricQuestion, request: Request):
     claims = verify_metric_request(request, body)
     return {"candidates": authorized_metric_candidates(
-        claims, body.question, body.datasource_id
+        claims, body.question, body.datasource_id, body.context
     )}
 
 
@@ -165,7 +166,8 @@ async def metric_candidates(body: InternalMetricQuestion, request: Request):
 async def metric_model(body: MetricModelRequest, request: Request):
     claims = verify_metric_request(request, body)
     return await invoke_metric_model(
-        claims, body.question, body.datasource_id, body.candidates
+        claims, body.question, body.datasource_id, body.candidates, body.context,
+        [repair.model_dump() for repair in body.repairs],
     )
 
 

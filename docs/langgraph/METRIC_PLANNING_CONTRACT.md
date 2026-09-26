@@ -142,3 +142,29 @@
 | 新的混合召回 | 93% | 40/43 |
 
 剩下 3 道都是只能靠语义召回找到的改写问法。所有召回成功的题，编译后的 SQL 结果都与标准答案一致。真实模型的准确率需要用 live 模式配置模型后测量。
+
+## 规划循环：有界修复、澄清与多轮追问（C包，2026-09-26）
+
+### 有界修复
+
+- 计划校验失败（`metric_plan_invalid`、`metric_not_authorized`、`metric_dimension_not_allowed`、`metric_filter_not_allowed`、`metric_time_range_not_allowed`）或编译返回 `metric_compile_failed` 时，图会带着被拒的回复和错误码重新调用模型，最多 `GRAPH_MAX_PLAN_REPAIRS` 次（图服务环境变量，默认 2，上限 3）。
+- 权限、网关和超时类错误不会重试。所有重试仍受 A 包的统一截止时间约束。
+- `/internal/graph/metrics/model` 新增 `repairs: [{previous, error}]`（最多 3 条，错误码限定在上面的白名单内）。后端把它们还原成"模型上一轮回复 + 拒绝原因说明"两条消息，说明文字固定在 `REPAIR_HINTS`，不透传任意文本。
+- 响应新增 `repairs`（重试次数）。`model_calls` 与 `usage` 在多次调用间累加；只要有一次用量未知，总量就记为 null。
+
+### 澄清与拒答
+
+- 模型可以不给计划，而是返回 `{"clarification": "<一句话追问>", "reason": "ambiguous" | "unsupported"}`：
+  - `ambiguous`：两个以上候选同样合适；
+  - `unsupported`：没有候选能回答。
+- 提示词要求：有合理默认值时不要追问（没说时间就不限时间，没说分组就不分组）。
+- 响应状态为 `needs_clarification`，并附带 `clarification` 和 `clarification_reason`；不编译、不执行。格式不合法的澄清回复按 `metric_plan_invalid` 进入修复。
+- 聊天里以普通文字显示，前缀为"需要确认："或"暂时无法回答："，存入记录的 error 字段（旧前端把纯文本 error 渲染为正文）。用户的下一句话作为追问进入多轮上下文。
+- 暂不使用 LangGraph interrupt/checkpoint 恢复：当前每次提问都是一次同步运行，"恢复"就是下一次带上下文的提问。
+
+### 多轮追问
+
+- 问题请求新增 `context`：同一会话里更早的最多 3 个问题（按时间正序，每条不超过 2000 字）。聊天入口会排除分析、预测和数据源占位记录。
+- `context` 纳入签名的 `request_hash`：`sha256(datasource_id + "\n" + question [+ "\n" + JSON(context)])`。没有上下文时哈希与之前完全相同。上下文被篡改、增删都会返回 401。
+- 召回先按当前问题找候选，不足 10 个时再用上下文补充；因此"那7月呢？"也能找回上一问的指标。
+- 提示词列出之前的问题，要求沿用之前的指标、维度、过滤和时间，除非本次问题明确改变了它们。

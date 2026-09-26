@@ -1,16 +1,18 @@
 # Metric planning evaluation: metric-sales-v1
 
 - Mode: `scripted`; candidate recall: `hybrid`; today: 2026-09-25T10:00:00 (Asia/Shanghai)
-- Passed: **40/43** (93%)
-- Gold metric among candidates: 93% of 41 answerable cases
-- Tokens: n/a; latency p50 10.3 ms, p95 11.9 ms
+- Passed: **44/47** (94%)
+- Gold metric among candidates: 93% of 44 answerable cases
+- Model calls: 41 (repairs 0, passed after repair 0); clarifications 0
+- Tokens: n/a; latency p50 18.1 ms, p95 21.7 ms
 
 | Category | Passed |
 | --- | --- |
 | basic | 4/4 |
 | dimension | 4/4 |
 | filter | 8/8 |
-| refusal | 2/2 |
+| follow_up | 3/3 |
+| refusal | 3/3 |
 | synonym | 6/9 |
 | time_absolute | 6/6 |
 | time_relative | 10/10 |

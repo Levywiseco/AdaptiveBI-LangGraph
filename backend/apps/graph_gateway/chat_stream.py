@@ -109,6 +109,24 @@ def _is_first_question(session: Session, chat_id: int, record_id: int) -> bool:
     return earlier is None
 
 
+CONTEXT_QUESTIONS = 3
+_CLARIFICATION_PREFIX = {"ambiguous": "需要确认：", "unsupported": "暂时无法回答："}
+
+
+def _conversation_context(session: Session, chat_id: int, record_id: int) -> list[str]:
+    """Up to three earlier questions of this chat, oldest first, for follow-ups."""
+    rows = session.exec(
+        select(ChatRecord.question).where(
+            ChatRecord.chat_id == chat_id,
+            ChatRecord.id < record_id,
+            or_(ChatRecord.first_chat.is_(None), ChatRecord.first_chat.is_(False)),
+            ChatRecord.analysis_record_id.is_(None),
+            ChatRecord.predict_record_id.is_(None),
+        ).order_by(ChatRecord.id.desc()).limit(CONTEXT_QUESTIONS)
+    ).all()
+    return [question.strip()[:2000] for question in reversed(rows) if question and question.strip()]
+
+
 def _sse(payload: dict[str, Any]) -> str:
     return "data:" + orjson.dumps(payload).decode() + "\n\n"
 
@@ -174,9 +192,15 @@ async def maybe_stream_graph_answer(session: Session, current_user, request_ques
                         "type": "datasource"}))
 
     try:
+        context = _conversation_context(session, chat.id, record.id)
         result = await run_metric_query(current_user.id, current_user.oid,
-                                        request_question.question, chat.datasource)
-        graph_error = None if result.status == "completed" else _engine_error_message(result.error)
+                                        request_question.question, chat.datasource, context)
+        if result.status == "needs_clarification" and result.clarification:
+            # Shown as the answer text (the legacy UI renders plain record errors
+            # as normal text); the user's reply arrives as the next follow-up.
+            graph_error = _CLARIFICATION_PREFIX.get(result.clarification_reason, "") + result.clarification
+        else:
+            graph_error = None if result.status == "completed" else _engine_error_message(result.error)
     except HTTPException as exc:
         result = None
         graph_error = _engine_error_message(exc.detail if isinstance(exc.detail, str) else None)

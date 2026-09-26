@@ -25,6 +25,15 @@ class MetricQuestionRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     question: str = Field(min_length=1, max_length=2000)
     datasource_id: int = Field(gt=0)
+    # Earlier questions of the same conversation, oldest first (follow-ups).
+    context: list[str] = Field(default_factory=list, max_length=3)
+
+    @field_validator("context")
+    @classmethod
+    def bounded_context(cls, value):
+        if any(not isinstance(item, str) or not item.strip() or len(item) > 2000 for item in value):
+            raise ValueError("context_invalid")
+        return value
 
     @field_validator("question")
     @classmethod
@@ -44,8 +53,17 @@ class MetricCandidateRef(BaseModel):
     metric_version_id: int = Field(gt=0)
 
 
+class PlanRepair(BaseModel):
+    """One rejected model reply and why it was rejected, for a bounded retry."""
+    model_config = ConfigDict(extra="forbid")
+    previous: str = Field(min_length=1, max_length=16000)
+    error: Literal["metric_plan_invalid", "metric_not_authorized", "metric_dimension_not_allowed",
+                   "metric_filter_not_allowed", "metric_time_range_not_allowed", "metric_compile_failed"]
+
+
 class MetricModelRequest(InternalMetricQuestion):
     candidates: list[MetricCandidateRef] = Field(min_length=1, max_length=20)
+    repairs: list[PlanRepair] = Field(default_factory=list, max_length=3)
 
 
 class MetricCompileRequest(InternalMetricQuestion):
@@ -85,7 +103,10 @@ class MetricPlanResponse(BaseModel):
     model_config = ConfigDict(extra="forbid")
     mode: Literal["metric-plan"] = "metric-plan"
     run_id: UUID
-    status: Literal["completed", "failed", "rejected"]
+    status: Literal["completed", "failed", "rejected", "needs_clarification"]
+    clarification: str | None = None
+    clarification_reason: Literal["ambiguous", "unsupported"] | None = None
+    repairs: int = Field(default=0, ge=0)
     metric_id: int | None = None
     metric_code: str | None = None
     metric_name: str | None = None
@@ -112,7 +133,10 @@ class MetricQueryResponse(BaseModel):
     model_config = ConfigDict(extra="forbid")
     mode: Literal["metric-query"] = "metric-query"
     run_id: UUID
-    status: Literal["completed", "failed", "rejected"]
+    status: Literal["completed", "failed", "rejected", "needs_clarification"]
+    clarification: str | None = None
+    clarification_reason: Literal["ambiguous", "unsupported"] | None = None
+    repairs: int = Field(default=0, ge=0)
     metric_id: int | None = None
     metric_code: str | None = None
     metric_name: str | None = None

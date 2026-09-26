@@ -45,7 +45,7 @@ def render_cases() -> str:
         expected = ({"outcome": "refusal"} if gold is None else
                     {"outcome": "success", "rows": oracle_rows(orders, case)})
         entry = {"id": case.id, "category": case.category, "question": case.question,
-                 "gold": gold, "expected": expected}
+                 "context": case.context, "gold": gold, "expected": expected}
         if case.note:
             entry["note"] = case.note
         cases.append(entry)

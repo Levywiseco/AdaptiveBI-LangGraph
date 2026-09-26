@@ -75,6 +75,15 @@ class MetricQuestionRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     question: str = Field(min_length=1, max_length=2000)
     datasource_id: int = Field(gt=0)
+    # Earlier questions of the same conversation, oldest first (follow-ups).
+    context: list[str] = Field(default_factory=list, max_length=3)
+
+    @field_validator("context")
+    @classmethod
+    def bounded_context(cls, value):
+        if any(not isinstance(item, str) or not item.strip() or len(item) > 2000 for item in value):
+            raise ValueError("context_invalid")
+        return value
 
     @field_validator("question")
     @classmethod
@@ -137,7 +146,10 @@ class MetricPlanResponse(BaseModel):
     model_config = ConfigDict(extra="forbid")
     mode: Literal["metric-plan"] = "metric-plan"
     run_id: UUID
-    status: Literal["completed", "failed", "rejected"]
+    status: Literal["completed", "failed", "rejected", "needs_clarification"]
+    clarification: str | None = None
+    clarification_reason: Literal["ambiguous", "unsupported"] | None = None
+    repairs: int = Field(default=0, ge=0)
     metric_id: int | None = None
     metric_code: str | None = None
     metric_name: str | None = None
@@ -165,7 +177,10 @@ class MetricQueryResponse(BaseModel):
     model_config = ConfigDict(extra="forbid")
     mode: Literal["metric-query"] = "metric-query"
     run_id: UUID
-    status: Literal["completed", "failed", "rejected"]
+    status: Literal["completed", "failed", "rejected", "needs_clarification"]
+    clarification: str | None = None
+    clarification_reason: Literal["ambiguous", "unsupported"] | None = None
+    repairs: int = Field(default=0, ge=0)
     metric_id: int | None = None
     metric_code: str | None = None
     metric_name: str | None = None

@@ -152,12 +152,16 @@ Planner = Callable[[list, dict], tuple[str, dict]]
 
 
 def scripted_planner(env: Environment) -> Planner:
+    """Answers every call with the gold plan, or a clarification when the case has none."""
     def plan(_messages, case):
-        gold = case["gold"] or {}
-        metric_id, version_id = env.metric_ids.get(gold.get("metric"), (1, 1))
+        gold = case["gold"]
+        if gold is None:
+            return json.dumps({"clarification": "指标库里没有能回答这个问题的指标，换个问法？",
+                               "reason": "unsupported"}, ensure_ascii=False), {}
+        metric_id, version_id = env.metric_ids[gold["metric"]]
         return json.dumps({"metric_id": metric_id, "metric_version_id": version_id,
-                           "dimensions": gold.get("dimensions", []), "filters": gold.get("filters", []),
-                           "time_range": gold.get("time_range"), "limit": gold.get("limit")},
+                           "dimensions": gold["dimensions"], "filters": gold["filters"],
+                           "time_range": gold["time_range"], "limit": gold["limit"]},
                           ensure_ascii=False), {}
     return plan
 
@@ -193,62 +197,126 @@ def live_planner() -> Planner:
 
 # --- Running cases -----------------------------------------------------------
 
+class EvalGateway:
+    """In-process stand-in for the backend gateway, calling the same backend code.
+
+    The graph service's real LangGraph flow (repairs, clarification) drives it.
+    """
+
+    def __init__(self, env: Environment, case: dict, planner: Planner, now: datetime, hybrid: bool):
+        self.env, self.case, self.planner, self.now, self.hybrid = env, case, planner, now, hybrid
+        self.candidate_dicts: list[dict] = []
+        self.compiled: Optional[dict] = None
+        self.calls = 0
+        self.usage: dict[str, Optional[int]] = {}
+
+    def authorize(self):
+        return None
+
+    def candidates(self):
+        from app.planning import MetricCandidate
+
+        from apps.graph_gateway.service import candidates_with_context
+        from apps.metrics.crud.metric import get_metric_candidates
+
+        def recall(session, text, oid, datasource_id, limit, current_user):
+            return get_metric_candidates(session, text, oid, datasource_id, limit=limit,
+                                         current_user=current_user, hybrid=self.hybrid)
+
+        with Session(self.env.meta) as session:
+            self.candidate_dicts = candidates_with_context(
+                session, self.case["question"], 1, DATASOURCE_ID, ADMIN,
+                self.case.get("context") or [], recall=recall)
+        return [MetricCandidate.model_validate(item) for item in self.candidate_dicts]
+
+    def plan(self, _candidates, repairs):
+        from apps.graph_gateway.prompts import metric_planning_messages
+        from apps.metrics.service.dimension_values import planning_dimension_values
+
+        with Session(self.env.meta) as session:
+            known = planning_dimension_values(session, self.candidate_dicts, ADMIN, DATASOURCE_ID)
+        prompt_candidates = [
+            {**item, "dimension_values": known[item["metric_version_id"]]}
+            if item["metric_version_id"] in known else item
+            for item in self.candidate_dicts
+        ]
+        messages = metric_planning_messages(self.case["question"], prompt_candidates, self.now,
+                                            context=self.case.get("context") or [], repairs=repairs)
+        content, usage = self.planner(messages, self.case)
+        self.calls += 1
+        for key, value in usage.items():
+            if value is not None:
+                self.usage[key] = self.usage.get(key, 0) + value
+        return content
+
+    def compile(self, plan):
+        from app.contracts import ModelCallError
+        from fastapi import HTTPException
+
+        from apps.graph_gateway.service import _validated_plan_request
+        from apps.metrics.service.query_planner import preview_metric_query_plan
+
+        try:
+            metric_id, _version_id, payload = _validated_plan_request(plan.model_dump(mode="json"))
+            with Session(self.env.meta) as session:
+                self.compiled = preview_metric_query_plan(session, metric_id, payload, 1, ADMIN)
+        except HTTPException as exc:
+            raise ModelCallError("metric_compile_failed" if exc.status_code == 422
+                                 else "gateway_rejected") from None
+        return {key: self.compiled.get(key) for key in (
+            "metric_id", "metric_code", "metric_name", "metric_version_id", "metric_version",
+            "dimensions", "time_range", "sql_fingerprint", "compiler")}
+
+    def execute(self, _plan):
+        with self.env.data.connect() as connection:
+            cursor = connection.execute(text(self.compiled["sql"]))
+            rows = [dict(row._mapping) for row in cursor]
+        return {"metric_id": self.compiled["metric_id"], "sql_fingerprint": self.compiled["sql_fingerprint"],
+                "columns": list(rows[0]) if rows else [], "rows": rows, "row_count": len(rows),
+                "truncated": False, "elapsed_ms": 0.0}
+
+
 def run_case(env: Environment, case: dict, planner: Planner, now: datetime,
              hybrid: bool, tolerance: float) -> dict[str, Any]:
-    from app.planning import MetricCandidate, MetricPlanningError, parse_metric_plan
-    from fastapi import HTTPException
-
-    from apps.graph_gateway.prompts import metric_planning_messages
-    from apps.graph_gateway.service import _validated_plan_request
-    from apps.metrics.crud.metric import get_metric_candidates
-    from apps.metrics.service.dimension_values import planning_dimension_values
-    from apps.metrics.service.query_planner import preview_metric_query_plan
+    from app.metric_graph import build_metric_graph, recursion_limit
 
     gold_metric = (case.get("gold") or {}).get("metric")
     expected = case["expected"]
     result: dict[str, Any] = {"id": case["id"], "category": case["category"], "question": case["question"],
+                              "context": case.get("context") or [],
                               "expected_outcome": expected["outcome"], "gold_metric": gold_metric,
                               "candidates": [], "recalled": None, "planned_metric": None,
-                              "outcome": None, "error": None, "passed": False, "usage": {}}
+                              "outcome": None, "error": None, "clarification": None, "repairs": 0,
+                              "model_calls": 0, "passed": False, "usage": {}}
+    gateway = EvalGateway(env, case, planner, now, hybrid)
     started = perf_counter()
-    with Session(env.meta) as session:
-        candidates = get_metric_candidates(session, case["question"], 1, DATASOURCE_ID, limit=10,
-                                           current_user=ADMIN, hybrid=hybrid)
-        result["candidates"] = [item["metric_code"] for item in candidates]
-        if gold_metric:
-            result["recalled"] = gold_metric in result["candidates"]
-        if not candidates:
-            result.update(outcome="refusal", error="metric_not_found")
-        else:
-            known = planning_dimension_values(session, candidates, ADMIN, DATASOURCE_ID)
-            prompt_candidates = [
-                {**item, "dimension_values": known[item["metric_version_id"]]}
-                if item["metric_version_id"] in known else item
-                for item in candidates
-            ]
-            messages = metric_planning_messages(case["question"], prompt_candidates, now)
-            try:
-                content, result["usage"] = planner(messages, case)
-                plan = parse_metric_plan(content, [MetricCandidate.model_validate(item) for item in candidates])
-                result["planned_metric"] = next(item["metric_code"] for item in candidates
-                                                if item["metric_id"] == plan.metric_id)
-                metric_id, _version_id, payload = _validated_plan_request(plan.model_dump(mode="json"))
-                compiled = preview_metric_query_plan(session, metric_id, payload, 1, ADMIN)
-                with env.data.connect() as connection:
-                    cursor = connection.execute(text(compiled["sql"]))
-                    rows = [dict(row._mapping) for row in cursor]
-                result.update(outcome="success", rows=rows)
-            except MetricPlanningError as exc:
-                result.update(outcome="rejected", error=exc.code)
-            except HTTPException as exc:
-                result.update(outcome="rejected", error=str(exc.detail))
-            except Exception as exc:  # provider or network failure in live mode
-                status = getattr(exc, "status_code", None)
-                result.update(outcome="error",
-                              error=type(exc).__name__ + (f" (HTTP {status})" if status else ""))
+    try:
+        state = build_metric_graph(gateway, execute=True).invoke(
+            {"question": case["question"], "datasource_id": DATASOURCE_ID},
+            {"recursion_limit": recursion_limit() + 1})
+    except Exception as exc:  # provider or network failure in live mode
+        status = getattr(exc, "status_code", None)
+        state = {"status": "error", "error": type(exc).__name__ + (f" (HTTP {status})" if status else "")}
     result["latency_ms"] = round((perf_counter() - started) * 1000, 1)
+    result["candidates"] = [item["metric_code"] for item in gateway.candidate_dicts]
+    if gold_metric:
+        result["recalled"] = gold_metric in result["candidates"]
+    result.update(repairs=state.get("repairs", 0), model_calls=gateway.calls, usage=gateway.usage,
+                  error=state.get("error"), clarification=state.get("clarification"))
+    status = state.get("status")
+    if status == "completed":
+        result.update(outcome="success", rows=state.get("rows", []), planned_metric=state.get("metric_code"))
+    elif status == "needs_clarification":
+        result["outcome"] = "clarification"
+    elif status == "rejected" and state.get("error") == "metric_not_found":
+        result["outcome"] = "refusal"
+    elif status == "rejected":
+        result["outcome"] = "rejected"
+    else:
+        result["outcome"] = "error"
     if expected["outcome"] == "refusal":
-        result["passed"] = result["outcome"] in ("refusal", "rejected")
+        # Not guessing is correct: no candidate, a clarification or a rejected plan.
+        result["passed"] = result["outcome"] in ("refusal", "clarification", "rejected")
     else:
         result["passed"] = (result["outcome"] == "success"
                             and unordered_rows_equal(expected["rows"], result["rows"], tolerance))
@@ -274,6 +342,10 @@ def summarize(results: list[dict[str, Any]]) -> dict[str, Any]:
             for category in categories
         },
         "total_tokens": sum(usage) if usage else None,
+        "model_calls": sum(item["model_calls"] for item in results),
+        "repairs": sum(item["repairs"] for item in results),
+        "repaired_and_passed": sum(1 for item in results if item["repairs"] and item["passed"]),
+        "clarifications": sum(1 for item in results if item["outcome"] == "clarification"),
         "p50_latency_ms": latencies[len(latencies) // 2],
         "p95_latency_ms": latencies[min(len(latencies) - 1, int(len(latencies) * 0.95))],
     }
@@ -289,6 +361,8 @@ def render_report(suite_info: dict, mode: str, hybrid: bool, summary: dict,
         f"today: {suite_info['now']} ({suite_info['timezone']})",
         f"- Passed: **{summary['passed']}/{summary['cases']}** ({summary['pass_rate']:.0%})",
         f"- Gold metric among candidates: {recall['rate']:.0%} of {recall['count']} answerable cases",
+        f"- Model calls: {summary['model_calls']} (repairs {summary['repairs']}, "
+        f"passed after repair {summary['repaired_and_passed']}); clarifications {summary['clarifications']}",
         f"- Tokens: {summary['total_tokens'] if summary['total_tokens'] is not None else 'n/a'}; "
         f"latency p50 {summary['p50_latency_ms']} ms, p95 {summary['p95_latency_ms']} ms",
         "",
@@ -306,6 +380,8 @@ def render_report(suite_info: dict, mode: str, hybrid: bool, summary: dict,
                 detail = f"planned `{item['planned_metric']}` instead of `{item['gold_metric']}`"
             elif item["outcome"] == "success":
                 detail = "rows differ from the answer key"
+            elif item["outcome"] == "clarification":
+                detail = f"asked instead of answering: {item['clarification']}"
             else:
                 detail = item["error"] or ""
             lines.append(f"| {item['id']} | {item['question']} | {item['outcome']} | {detail} |")

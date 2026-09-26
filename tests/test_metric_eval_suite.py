@@ -47,3 +47,36 @@ def test_report_lists_recall_misses(scripted):
     report = metric_eval.render_report(suite_info, "scripted", True, summary, results)
     assert "Gold metric among candidates" in report
     assert all(case_id in report for case_id in {item["id"] for item in results if not item["passed"]})
+
+
+@pytest.mark.parametrize("values,message", [
+    ({"EVAL_MODEL_API_KEY": "你的key"}, "EVAL_MODEL_API_KEY contains non-ASCII"),
+    ({"EVAL_MODEL_NAME": "你的模型名"}, "EVAL_MODEL_NAME contains non-ASCII"),
+    ({"EVAL_MODEL_BASE_URL": "api.moonshot.cn/v1"}, "must start with http"),
+    ({"EVAL_MODEL_NAME": "  "}, "live mode needs EVAL_MODEL_NAME"),
+])
+def test_live_mode_rejects_placeholder_configuration(monkeypatch, values, message):
+    base = {"EVAL_MODEL_BASE_URL": "https://api.example.invalid/v1",
+            "EVAL_MODEL_API_KEY": "sk-test", "EVAL_MODEL_NAME": "model"}
+    for key, value in {**base, **values}.items():
+        monkeypatch.setenv(key, value)
+    with pytest.raises(SystemExit) as stop:
+        metric_eval.live_planner()
+    assert message in str(stop.value) and "你的" not in str(stop.value)
+
+
+def test_live_mode_stops_after_repeated_model_errors(monkeypatch):
+    calls = []
+
+    class ProviderError(Exception):
+        status_code = 401
+
+    def failing(_messages, _case):
+        calls.append(1)
+        raise ProviderError("invalid api key")
+
+    monkeypatch.setattr(metric_eval, "live_planner", lambda: failing)
+    with pytest.raises(SystemExit) as stop:
+        metric_eval.evaluate("live")
+    assert "3 consecutive model errors (ProviderError (HTTP 401))" in str(stop.value)
+    assert len(calls) == 3

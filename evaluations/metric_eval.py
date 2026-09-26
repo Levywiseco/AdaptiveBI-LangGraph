@@ -58,6 +58,7 @@ from sqlmodel import Session  # noqa: E402
 
 ADMIN = SimpleNamespace(id=1, account="admin", oid=1, isAdmin=True)
 DATASOURCE_ID = 1
+MAX_CONSECUTIVE_ERRORS = 3
 
 
 @dataclass
@@ -166,13 +167,21 @@ def live_planner() -> Planner:
     from apps.graph_gateway.model_policy import gateway_model_config
     from apps.graph_gateway.service import usage_from
 
-    missing = [key for key in ("EVAL_MODEL_BASE_URL", "EVAL_MODEL_API_KEY", "EVAL_MODEL_NAME")
-               if not os.environ.get(key)]
+    keys = ("EVAL_MODEL_BASE_URL", "EVAL_MODEL_API_KEY", "EVAL_MODEL_NAME")
+    missing = [key for key in keys if not os.environ.get(key, "").strip()]
     if missing:
         raise SystemExit("live mode needs " + ", ".join(missing))
+    # Values end up in HTTP headers and URLs; non-ASCII text is almost always an
+    # unreplaced placeholder. The message names the variable, never its value.
+    invalid = [key for key in keys if not os.environ[key].strip().isascii()]
+    if invalid:
+        raise SystemExit(", ".join(invalid) + " contains non-ASCII characters; replace the placeholder value")
+    if not os.environ["EVAL_MODEL_BASE_URL"].startswith(("http://", "https://")):
+        raise SystemExit("EVAL_MODEL_BASE_URL must start with http:// or https://")
     config, _policy = gateway_model_config(LLMConfig(
-        model_type="openai", model_name=os.environ["EVAL_MODEL_NAME"],
-        api_key=os.environ["EVAL_MODEL_API_KEY"], api_base_url=os.environ["EVAL_MODEL_BASE_URL"]))
+        model_type="openai", model_name=os.environ["EVAL_MODEL_NAME"].strip(),
+        api_key=os.environ["EVAL_MODEL_API_KEY"].strip(),
+        api_base_url=os.environ["EVAL_MODEL_BASE_URL"].strip()))
     model = LLMFactory.create_llm(config).llm
 
     def plan(messages, _case):
@@ -234,7 +243,9 @@ def run_case(env: Environment, case: dict, planner: Planner, now: datetime,
             except HTTPException as exc:
                 result.update(outcome="rejected", error=str(exc.detail))
             except Exception as exc:  # provider or network failure in live mode
-                result.update(outcome="error", error=type(exc).__name__)
+                status = getattr(exc, "status_code", None)
+                result.update(outcome="error",
+                              error=type(exc).__name__ + (f" (HTTP {status})" if status else ""))
     result["latency_ms"] = round((perf_counter() - started) * 1000, 1)
     if expected["outcome"] == "refusal":
         result["passed"] = result["outcome"] in ("refusal", "rejected")
@@ -309,7 +320,15 @@ def evaluate(mode: str = "scripted", hybrid: bool = True, cases_path: Path = sui
     env = build_environment()
     planner = scripted_planner(env) if mode == "scripted" else live_planner()
     now = datetime.fromisoformat(suite_info["now"])
-    results = [run_case(env, case, planner, now, hybrid, suite_info["float_tolerance"]) for case in cases]
+    results = []
+    consecutive_errors = 0
+    for case in cases:
+        results.append(run_case(env, case, planner, now, hybrid, suite_info["float_tolerance"]))
+        consecutive_errors = consecutive_errors + 1 if results[-1]["outcome"] == "error" else 0
+        if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
+            # A wrong key, model name or endpoint fails every case the same way.
+            raise SystemExit(f"stopped after {consecutive_errors} consecutive model errors "
+                             f"({results[-1]['error']}); check the model configuration")
     return suite_info, summarize(results), results
 
 

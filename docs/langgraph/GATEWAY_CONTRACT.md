@@ -57,7 +57,7 @@ SafeResponse 字段：mode=synthetic-live、run_id、model_config_id、status、
 - 网关自行构造合成数据 prompt，只发送允许的 schema 和问题，不接收任意角色消息；模型密钥不离开旧后端。
 - 原后端依赖未升级。新服务仅新增其运行所需的 httpx、PyJWT，并更新独立锁文件。
 - 并发模型调用每个旧后端进程最多4个；排队0.2秒后拒绝。SDK自动重试关闭，SDK超时25秒，外层调用上限30秒，输出上限2048 token。
-- 图服务授权检查HTTP超时3秒，模型HTTP超时35秒，旧入口HTTP超时45秒。超时不保证供应商未计费或远端瞬间停止，因此未返回用量时记录 null。
+- 图服务授权检查HTTP超时3秒，模型HTTP超时35秒，旧入口HTTP超时45秒（合成实验入口；指标入口已改为 `GRAPH_REQUEST_TIMEOUT` 统一截止时间，见 METRIC_PLANNING_CONTRACT.md）。超时不保证供应商未计费或远端瞬间停止，因此未返回用量时记录 null。
 - 用量优先读取 LangChain usage_metadata，再读取已有 response_metadata.token_usage；缺失项为 null，不估算成0。网关以 run_id、model_config_id、次数、用量和耗时记录结构化日志，不记录秘密、原始提示词或完整响应。
 - 模型调用期间不持有业务 ORM Session。没有自动纠错和跨层重试。
 - 空输出、代码围栏、说明文字等明确失败；危险 SQL 被拒绝。保持合成 SQLite 的单表、只读、字段及函数限制；本轮不拓宽支持的SQL方言和查询形态。

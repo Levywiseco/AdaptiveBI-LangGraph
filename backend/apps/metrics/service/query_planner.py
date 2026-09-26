@@ -6,6 +6,7 @@ from datetime import date, datetime
 from decimal import Decimal
 from typing import Any
 
+import sqlglot
 from fastapi import HTTPException
 from sqlalchemy import and_
 from sqlglot import exp
@@ -217,6 +218,28 @@ def _compile_filter(
     raise _error(f"Unsupported filter operator '{operator}' for field '{field}'")
 
 
+def _row_permission_condition(raw: str, table: str, dialect: str | None) -> exp.Expression:
+    """Bind one legacy row-permission WHERE fragment to the metric table.
+
+    The fragment comes from admin-configured rules rendered by the legacy permission
+    module. Anything other than a plain predicate over this table fails closed.
+    """
+    denied = _error("Row permission rule could not be applied to the metric query", 403)
+    try:
+        condition = sqlglot.condition(raw, dialect=dialect)
+    except sqlglot.errors.SqlglotError:
+        raise denied from None
+    if condition.find(exp.Query, exp.Subquery, exp.Command) is not None:
+        raise denied
+    for column in condition.find_all(exp.Column):
+        if column.args.get("db") or column.args.get("catalog"):
+            raise denied
+        if column.table and column.table.casefold() != table.casefold():
+            raise denied
+        column.set("table", exp.to_identifier(table, quoted=True))
+    return exp.paren(condition)
+
+
 def _allowed_version_field(reference: str, allowed_fields: list[str]) -> bool:
     requested_table, requested_field = _field_key(reference)
     for allowed in allowed_fields:
@@ -291,8 +314,13 @@ def compile_metric_plan(
     datasource: CoreDatasource,
     request: MetricQueryPlanRequest,
     catalog: dict[str, set[str]],
+    row_filters: list[dict[str, str]] | None = None,
 ) -> dict[str, Any]:
-    """Compile an immutable metric version and constrained query plan to one SELECT."""
+    """Compile an immutable metric version and constrained query plan to one SELECT.
+
+    ``row_filters`` are the caller's row-permission fragments; they are compiled into
+    the statement so the SQL fingerprint covers the permission boundary.
+    """
 
     if len(version.required_tables) != 1:
         raise _error(
@@ -305,6 +333,7 @@ def compile_metric_plan(
     )
     if actual_required_table is None:
         raise _error(f"Required table '{required_table}' is unavailable")
+    dialect = SQLGLOT_DIALECTS.get(datasource.type.casefold()) if datasource.type else None
 
     dimension_columns: list[exp.Column] = []
     dimensions: list[str] = []
@@ -330,6 +359,12 @@ def compile_metric_plan(
         conditions.append(condition)
         normalized["source"] = "request"
         applied_filters.append(normalized)
+    for item in row_filters or []:
+        if item.get("table", "").casefold() != actual_required_table.casefold():
+            raise _error("Row permission rule targets a table outside the metric", 403)
+        conditions.append(
+            _row_permission_condition(item.get("filter") or "", actual_required_table, dialect)
+        )
 
     serialized_time_range: dict[str, str] | None = None
     if request.time_range:
@@ -363,7 +398,6 @@ def compile_metric_plan(
     if request.limit:
         query = query.limit(request.limit)
 
-    dialect = SQLGLOT_DIALECTS.get(datasource.type.casefold()) if datasource.type else None
     sql = query.sql(dialect=dialect, pretty=True)
     return {
         "metric_id": int(metric.id),
@@ -377,10 +411,28 @@ def compile_metric_plan(
         "applied_filters": applied_filters,
         "time_range": serialized_time_range,
         "required_tables": list(version.required_tables),
+        "row_permission_applied": bool(row_filters),
         "sql": sql,
         "sql_fingerprint": hashlib.sha256(sql.encode("utf-8")).hexdigest(),
         "compiler": COMPILER_VERSION,
     }
+
+
+def _row_permission_filters(
+    session: Session,
+    current_user: Any,
+    datasource: CoreDatasource,
+    tables: list[str],
+) -> list[dict[str, str]]:
+    """Same row rules the legacy engine applies to generated SQL (admin is exempt)."""
+    if not tables:
+        return []
+    # Lazy import: the permission module loads the optional xpack package.
+    from apps.datasource.crud.permission import get_row_permission_filters
+
+    return get_row_permission_filters(
+        session=session, current_user=current_user, ds=datasource, tables=tables
+    )
 
 
 def preview_metric_query_plan(
@@ -390,6 +442,9 @@ def preview_metric_query_plan(
     oid: int | None,
     current_user: Any,
 ) -> dict[str, Any]:
+    if current_user is None:
+        # Column visibility and row permissions both depend on the caller.
+        raise _error("A current user is required to apply datasource permissions", 403)
     workspace_id = int(oid or 1)
     metric = _get_definition(session, metric_id, workspace_id)
     datasource = session.get(CoreDatasource, metric.datasource_id)
@@ -420,7 +475,10 @@ def preview_metric_query_plan(
         raise _error("Metric version is outside the current user's datasource permissions", 403)
 
     catalog = _field_catalog(session, metric.datasource_id, version.required_tables)
-    plan = compile_metric_plan(metric, version, datasource, request, catalog)
+    row_filters = _row_permission_filters(session, current_user, datasource, list(catalog))
+    plan = compile_metric_plan(
+        metric, version, datasource, request, catalog, row_filters=row_filters
+    )
     # Keep the database driver/xpack import out of the pure compiler so it can be
     # tested and reused without initializing SQLBot's execution stack.
     from apps.db.db import check_sql_read

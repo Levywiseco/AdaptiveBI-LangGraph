@@ -156,6 +156,7 @@ def metric_query_experiment(monkeypatch):
         "sub": "7", "workspace": "2", "model_id": 10,
         "scope": ["metrics:read", "model:invoke", "metric:compile", "metric:execute"],
         "purpose": "metric-query", "iat": int(time.time()), "exp": int(time.time()) + 120,
+        "deadline": time.time() + 60,
         "datasource_id": 3, "run_id": body["run_id"],
         "request_hash": hashlib.sha256(("3\n" + body["question"]).encode()).hexdigest(),
     }
@@ -259,3 +260,58 @@ def test_plan_delegation_cannot_reach_query_endpoint(metric_query_experiment, mo
     body, headers = metric_query_experiment
     monkeypatch.setattr(httpx.Client, "post", lambda *args, **kwargs: pytest.fail("gateway called"))
     assert request_metric_query(body, headers(change)).status_code == 401
+
+
+@pytest.mark.parametrize("change", [
+    {"deadline": None}, {"deadline": "soon"}, {"deadline": int(time.time()) - 10},
+    {"deadline": int(time.time()) + 500},
+])
+def test_metric_query_requires_deadline_inside_delegation_lifetime(
+        metric_query_experiment, monkeypatch, change):
+    body, headers = metric_query_experiment
+    monkeypatch.setattr(httpx.Client, "post", lambda *args, **kwargs: pytest.fail("gateway called"))
+    assert request_metric_query(body, headers(change)).status_code == 401
+
+
+def test_metric_query_past_deadline_stops_before_any_backend_call(metric_query_experiment, monkeypatch):
+    body, headers = metric_query_experiment
+    calls = stub_backend(monkeypatch)
+    # Signed and inside the token lifetime, but the run budget is already spent.
+    data = request_metric_query(body, headers({"deadline": time.time() + 0.2})).json()
+    assert data["status"] == "failed" and data["error"] == "graph_deadline_exceeded"
+    assert calls == []
+
+
+def test_gateway_step_timeout_never_exceeds_remaining_budget(monkeypatch):
+    seen = []
+    original = httpx.Client.__init__
+
+    def init(self, *args, **kwargs):
+        seen.append(kwargs["timeout"])
+        original(self, *args, **kwargs)
+
+    gateway, _ = gateway_with_stub_request(monkeypatch, executed_payload())
+    monkeypatch.setattr(httpx.Client, "__init__", init)
+    gateway.execute(plan())
+    assert seen[-1] == 35  # no deadline: the step cap applies
+    gateway.deadline = time.time() + 10
+    gateway.execute(plan())
+    assert 9 < seen[-1] <= 10
+
+
+def test_gateway_maps_timeouts_after_deadline_to_deadline_error(monkeypatch):
+    gateway, _ = gateway_with_stub_request(monkeypatch, status=504)
+    gateway.deadline = time.time() + 30
+    with pytest.raises(ModelCallError) as error:
+        gateway.execute(plan())
+    assert error.value.code == "metric_execution_timeout"  # budget left: a real SQL timeout
+
+    def slow(self, url, **kwargs):
+        gateway.deadline = time.time()  # the budget runs out while waiting
+        raise httpx.ReadTimeout("slow", request=httpx.Request("POST", url))
+
+    monkeypatch.setattr(httpx.Client, "post", slow)
+    gateway.deadline = time.time() + 30
+    with pytest.raises(ModelCallError) as error:
+        gateway.execute(plan())
+    assert error.value.code == "graph_deadline_exceeded"

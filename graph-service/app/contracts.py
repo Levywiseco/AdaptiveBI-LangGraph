@@ -152,7 +152,8 @@ class MetricPlanResponse(BaseModel):
                    "metric_dimension_not_allowed", "metric_filter_not_allowed",
                    "metric_time_range_not_allowed", "metric_compile_failed",
                    "model_timeout", "model_call_failed", "model_output_invalid",
-                   "gateway_unavailable", "gateway_rejected", "graph_execution_failed"] | None = None
+                   "gateway_unavailable", "gateway_rejected", "graph_execution_failed",
+                   "graph_deadline_exceeded"] | None = None
     usage: ModelUsage = Field(default_factory=ModelUsage)
     model_calls: int | None = Field(default=0, ge=0)
     elapsed_ms: float = Field(default=0, ge=0)
@@ -184,7 +185,8 @@ class MetricQueryResponse(BaseModel):
                    "metric_time_range_not_allowed", "metric_compile_failed",
                    "metric_execution_failed", "metric_execution_timeout",
                    "model_timeout", "model_call_failed", "model_output_invalid",
-                   "gateway_unavailable", "gateway_rejected", "graph_execution_failed"] | None = None
+                   "gateway_unavailable", "gateway_rejected", "graph_execution_failed",
+                   "graph_deadline_exceeded"] | None = None
     usage: ModelUsage = Field(default_factory=ModelUsage)
     model_calls: int | None = Field(default=0, ge=0)
     elapsed_ms: float = Field(default=0, ge=0)

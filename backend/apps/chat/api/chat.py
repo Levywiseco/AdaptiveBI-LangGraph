@@ -352,7 +352,8 @@ async def stream_sql(session: SessionDep, current_user: CurrentUser, request_que
         # Grayscale routing: whitelisted workspaces answer via the LangGraph
         # metric engine; everything else continues on the legacy flow below.
         graph_response = await maybe_stream_graph_answer(
-            session, current_user, request_question, in_chat=in_chat)
+            session, current_user, request_question, in_chat=in_chat,
+            current_assistant=current_assistant, stream=stream)
         if graph_response is not None:
             return graph_response
         llm_service = await LLMService.create(session, current_user, request_question, current_assistant,

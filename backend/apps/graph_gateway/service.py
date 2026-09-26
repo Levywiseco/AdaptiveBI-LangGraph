@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import time
 from time import perf_counter
 from uuid import uuid4
 
@@ -17,11 +18,14 @@ from common.core.config import settings
 from common.core.db import engine
 from apps.graph_gateway.contracts import MetricQueryResponse
 from apps.graph_gateway.security import (
+    configured_ids,
     enabled,
     issue_metric_query_delegation,
     metric_datasource_enabled,
+    request_budget_seconds,
 )
 from apps.graph_gateway.model_policy import gateway_model_config
+from apps.graph_gateway.prompts import metric_planning_messages, planning_now
 from apps.metrics.crud.metric import get_metric_candidates
 from apps.metrics.schemas.metric import MetricQueryPlanRequest
 from apps.metrics.service.query_planner import preview_metric_query_plan
@@ -30,6 +34,8 @@ from apps.system.schemas.system_schema import UserInfoDTO
 MODEL_SLOTS = asyncio.Semaphore(4)
 EXECUTION_SLOTS = asyncio.Semaphore(4)
 PLAN_KEYS = {"metric_id", "metric_version_id", "dimensions", "filters", "time_range", "limit"}
+MODEL_STEP_SECONDS = 30
+MIN_STEP_SECONDS = 0.5
 SCHEMA = (
     "sales(id INTEGER, month TEXT, region TEXT, gross INTEGER, refund INTEGER); net = gross - refund. "
     "month stores YYYY-MM text, for example '2026-08' (August 2026), not full dates. "
@@ -39,8 +45,13 @@ SCHEMA = (
 
 def authorize_current(uid: int, oid: int):
     enabled()
-    if (str(uid) not in settings.GRAPH_TEST_USERS.split(",")
-            or str(oid) not in settings.GRAPH_TEST_WORKSPACES.split(",")):
+    try:
+        users = configured_ids(settings.GRAPH_TEST_USERS)
+        workspaces = configured_ids(settings.GRAPH_TEST_WORKSPACES)
+    except ValueError:
+        # A malformed allowlist fails closed instead of matching partial entries.
+        raise HTTPException(503, "gateway_configuration_required") from None
+    if uid not in users or oid not in workspaces:
         raise HTTPException(403, "experiment_not_allowed")
     # Never trust the cached login DTO for revocation-sensitive authorization.
     with Session(engine) as session:
@@ -58,6 +69,17 @@ def authorize_current(uid: int, oid: int):
         model = session.get(AiModelDetail, settings.GRAPH_MODEL_ID)
         if not model or model.status != 1 or model.protocol != 1:
             raise HTTPException(403, "model_not_allowed")
+
+
+def step_timeout(claims, cap: float) -> float:
+    """Timeout for one step: its own cap, never beyond the run deadline."""
+    deadline = claims.get("deadline")
+    if deadline is None:
+        return cap
+    remaining = deadline - time.time()
+    if remaining <= MIN_STEP_SECONDS:
+        raise HTTPException(504, "graph_deadline_exceeded")
+    return min(cap, remaining)
 
 
 def usage_from(message):
@@ -95,8 +117,6 @@ def authorized_metric_candidates(claims, question: str, datasource_id: int):
 
 
 async def invoke_metric_model(claims, question: str, datasource_id: int, candidate_refs):
-    from langchain_core.messages import HumanMessage, SystemMessage
-
     candidates = authorized_metric_candidates(claims, question, datasource_id)
     requested = {(item.metric_id, item.metric_version_id) for item in candidate_refs}
     if len(requested) != len(candidate_refs):
@@ -106,6 +126,8 @@ async def invoke_metric_model(claims, question: str, datasource_id: int, candida
     if not selected or len(selected) != len(requested):
         raise HTTPException(403, "metric_not_authorized")
     uid, oid = int(claims["sub"]), int(claims["workspace"])
+    messages = metric_planning_messages(question, selected, planning_now())
+    step_timeout(claims, MODEL_STEP_SECONDS)  # refuse to start a call that cannot finish
     try:
         await asyncio.wait_for(MODEL_SLOTS.acquire(), timeout=0.2)
     except asyncio.TimeoutError:
@@ -122,16 +144,9 @@ async def invoke_metric_model(claims, question: str, datasource_id: int, candida
         provider_family = policy.family
         model = LLMFactory.create_llm(config).llm
         authorize_current(uid, oid)
+        timeout = step_timeout(claims, MODEL_STEP_SECONDS)
         calls = 1
-        message = await asyncio.wait_for(model.ainvoke([
-            SystemMessage(content=(
-                "Select one authorized metric and return one JSON object only. Do not write SQL. "
-                "Use only candidate metric/version IDs, dimensions and time fields. Required keys: "
-                "metric_id, metric_version_id, dimensions, filters, time_range, limit. Candidates: "
-                + json.dumps(selected, ensure_ascii=False, separators=(",", ":"))
-            )),
-            HumanMessage(content=question),
-        ]), timeout=30)
+        message = await asyncio.wait_for(model.ainvoke(messages), timeout=timeout)
         usage = usage_from(message)
         authorize_current(uid, oid)
         content = message.content
@@ -209,6 +224,8 @@ async def execute_authorized_metric_plan(claims, question: str, datasource_id: i
     if (compiled["datasource_id"] != datasource_id or compiled["metric_version_id"] != version_id
             or not datasource or datasource.oid != oid):
         raise HTTPException(403, "metric_not_authorized")
+    # Never start a query the caller can no longer wait for.
+    timeout = step_timeout(claims, settings.GRAPH_METRIC_EXECUTION_TIMEOUT)
     try:
         await asyncio.wait_for(EXECUTION_SLOTS.acquire(), timeout=0.2)
     except asyncio.TimeoutError:
@@ -225,13 +242,13 @@ async def execute_authorized_metric_plan(claims, question: str, datasource_id: i
             # on timeout, so the overrun is logged instead of silently dropped.
             raw = await asyncio.wait_for(
                 asyncio.to_thread(exec_sql, datasource, compiled["sql"]),
-                timeout=settings.GRAPH_METRIC_EXECUTION_TIMEOUT,
+                timeout=timeout,
             )
         except asyncio.TimeoutError:
             logging.getLogger("adaptive.graph_gateway").warning(
                 "metric_execution_timeout %s", json.dumps({
                     "run_id": claims.get("run_id"), "metric_id": metric_id,
-                    "timeout_s": settings.GRAPH_METRIC_EXECUTION_TIMEOUT,
+                    "timeout_s": round(timeout, 3),
                     "background_state": "unknown",
                 }))
             raise HTTPException(504, "metric_execution_timeout") from None
@@ -324,7 +341,8 @@ async def run_metric_query(uid: int, oid: int, question: str, datasource_id: int
     run_id = uuid4()
     token = issue_metric_query_delegation(uid, oid, run_id, question, datasource_id)
     try:
-        async with httpx.AsyncClient(timeout=45, follow_redirects=False, trust_env=False) as client:
+        async with httpx.AsyncClient(timeout=request_budget_seconds(), follow_redirects=False,
+                                     trust_env=False) as client:
             response = await client.post(
                 settings.GRAPH_SERVICE_URL.rstrip("/") + "/internal/v1/metrics/query",
                 json={"question": question, "datasource_id": datasource_id, "run_id": str(run_id)},

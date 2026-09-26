@@ -48,6 +48,11 @@ class Settings(BaseSettings):
     GRAPH_DELEGATION_SECRET: str = ""
     GRAPH_METRIC_MAX_ROWS: int = 200
     GRAPH_METRIC_EXECUTION_TIMEOUT: int = 15
+    # Total seconds for one governed metric run (clamped to 5..110); every hop's
+    # timeout is derived from the deadline signed into the delegation.
+    GRAPH_REQUEST_TIMEOUT: int = 60
+    # "Today" for resolving relative periods such as 上个月 in metric planning.
+    GRAPH_PLANNING_TIMEZONE: str = "Asia/Shanghai"
     CHAT_ENGINE: Literal["legacy", "langgraph"] = "legacy"
     CHAT_ENGINE_WORKSPACES: str = ""
 

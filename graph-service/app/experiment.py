@@ -89,7 +89,7 @@ def verify_metric(request, body, purposes=frozenset(METRIC_PURPOSE_SCOPES)):
             issuer="adaptive-backend",
             options={"require": [
                 "sub", "workspace", "run_id", "model_id", "scope", "purpose",
-                "request_hash", "datasource_id", "iat", "exp",
+                "request_hash", "datasource_id", "deadline", "iat", "exp",
             ]},
         )
         expected_hash = hashlib.sha256(
@@ -105,6 +105,8 @@ def verify_metric(request, body, purposes=frozenset(METRIC_PURPOSE_SCOPES)):
             and claims["datasource_id"] == body.datasource_id
             and claims["request_hash"] == expected_hash
             and 0 < claims["exp"] - claims["iat"] <= 120
+            and type(claims["deadline"]) in (int, float)
+            and claims["iat"] < claims["deadline"] <= claims["exp"]
             and int(claims["sub"]) > 0
             and int(claims["workspace"]) > 0
             and type(claims["model_id"]) is int
@@ -153,12 +155,13 @@ def query(body: InternalQuestion, request: Request):
 
 @router.post("/internal/v1/metrics/plan", response_model=MetricPlanResponse)
 def metric_plan(body: InternalMetricQuestion, request: Request):
-    verify_metric(request, body)
+    claims = verify_metric(request, body)
     gateway = BusinessGateway(
         gateway_url=os.environ.get("GRAPH_GATEWAY_URL", "http://127.0.0.1:8000/api/v1"),
         service_token=os.environ["GRAPH_TO_GATEWAY_TOKEN"],
         delegation=request.headers["X-Graph-Delegation"],
         request_body=body.model_dump(mode="json"),
+        deadline=claims["deadline"],
     )
     graph = build_metric_graph(gateway)
     started = perf_counter()
@@ -190,12 +193,13 @@ def metric_plan(body: InternalMetricQuestion, request: Request):
 @router.post("/internal/v1/metrics/query", response_model=MetricQueryResponse)
 def metric_query(body: InternalMetricQuestion, request: Request):
     # Only plan-and-execute delegations reach this endpoint.
-    verify_metric(request, body, purposes=frozenset({"metric-query"}))
+    claims = verify_metric(request, body, purposes=frozenset({"metric-query"}))
     gateway = BusinessGateway(
         gateway_url=os.environ.get("GRAPH_GATEWAY_URL", "http://127.0.0.1:8000/api/v1"),
         service_token=os.environ["GRAPH_TO_GATEWAY_TOKEN"],
         delegation=request.headers["X-Graph-Delegation"],
         request_body=body.model_dump(mode="json"),
+        deadline=claims["deadline"],
     )
     graph = build_metric_graph(gateway, execute=True)
     started = perf_counter()

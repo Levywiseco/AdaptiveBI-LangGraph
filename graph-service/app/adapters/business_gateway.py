@@ -1,3 +1,4 @@
+import time
 from typing import Any
 
 import httpx
@@ -5,6 +6,8 @@ from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, SecretStr, Valid
 
 from app.contracts import ModelCallError, ModelUsage
 from app.planning import MetricCandidate, MetricQueryPlan
+
+MIN_STEP_SECONDS = 0.5
 
 
 class CompiledMetric(BaseModel):
@@ -60,6 +63,8 @@ class BusinessGateway(BaseModel):
     service_token: SecretStr = Field(exclude=True)
     delegation: SecretStr = Field(exclude=True)
     request_body: dict = Field(exclude=True)
+    # Absolute epoch deadline signed into the delegation; None keeps the step caps.
+    deadline: float | None = Field(default=None, exclude=True)
     _usage: ModelUsage = PrivateAttr(default_factory=ModelUsage)
     _calls: int | None = PrivateAttr(default=0)
 
@@ -71,11 +76,23 @@ class BusinessGateway(BaseModel):
     def calls(self) -> int | None:
         return self._calls
 
+    def _deadline_passed(self) -> bool:
+        return self.deadline is not None and self.deadline - time.time() <= MIN_STEP_SECONDS
+
+    def _timeout(self, cap: float) -> float:
+        """A step's own cap, never beyond the run deadline; refuse steps that cannot finish."""
+        if self.deadline is None:
+            return cap
+        if self._deadline_passed():
+            raise ModelCallError("graph_deadline_exceeded")
+        return min(cap, self.deadline - time.time())
+
     def _request(self, endpoint: str, extra: dict[str, Any] | None = None) -> dict:
         body = {**self.request_body, **(extra or {})}
+        timeout = self._timeout(3 if endpoint.endswith(("/authorize", "/candidates")) else 35)
         try:
             with httpx.Client(
-                timeout=3 if endpoint.endswith(("/authorize", "/candidates")) else 35,
+                timeout=timeout,
                 follow_redirects=False,
                 trust_env=False,
             ) as client:
@@ -89,6 +106,8 @@ class BusinessGateway(BaseModel):
                 )
             if response.status_code in (401, 403, 404):
                 raise ModelCallError("gateway_rejected")
+            if response.status_code == 504 and self._deadline_passed():
+                raise ModelCallError("graph_deadline_exceeded")
             if response.status_code == 422 and endpoint.endswith("/compile"):
                 raise ModelCallError("metric_compile_failed")
             if endpoint.endswith("/execute"):
@@ -108,6 +127,8 @@ class BusinessGateway(BaseModel):
         except ModelCallError:
             raise
         except httpx.TimeoutException:
+            if self._deadline_passed():
+                raise ModelCallError("graph_deadline_exceeded") from None
             code = "model_timeout" if endpoint.endswith("/model") else "gateway_unavailable"
             raise ModelCallError(code) from None
         except Exception:

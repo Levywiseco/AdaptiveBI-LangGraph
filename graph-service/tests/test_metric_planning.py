@@ -6,7 +6,6 @@ from app.planning import (
     MetricCandidate,
     MetricPlanningError,
     parse_metric_plan,
-    planning_prompt,
 )
 
 
@@ -89,10 +88,3 @@ def test_plan_requires_every_contract_key(candidate, removed):
     with pytest.raises(MetricPlanningError) as error:
         parse_metric_plan(json.dumps(value), [candidate])
     assert error.value.code == "metric_plan_invalid"
-
-
-def test_prompt_contains_no_formula_sql_or_connection_data(candidate):
-    messages = planning_prompt("八月东部净销售额", [candidate])
-    serialized = json.dumps(messages, ensure_ascii=False)
-    assert "net_sales" in serialized and "paid_at" in serialized
-    assert "expression" not in serialized and "api_key" not in serialized and "SELECT" not in serialized

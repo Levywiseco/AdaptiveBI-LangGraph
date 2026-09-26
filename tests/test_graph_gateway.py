@@ -134,6 +134,8 @@ def test_metric_signed_binding_and_datasource_allowlist(configured, monkeypatch)
 @pytest.mark.parametrize("changes", [
     {"aud": "other"}, {"scope": []}, {"purpose": "other"}, {"model_id": 999},
     {"exp": 1}, {"run_id": "other"}, {"datasource_id": 4}, {"request_hash": "other"},
+    {"deadline": None}, {"deadline": "soon"}, {"deadline": 1},
+    {"deadline": int(time.time()) + 5000},
 ])
 def test_invalid_metric_delegation(configured, changes):
     body, request = metric_body_and_request(changes)
@@ -302,7 +304,7 @@ def test_metric_compile_returns_metadata_without_sql(configured, monkeypatch):
     assert error.value.status_code == 422
 
 
-def install_isolated_sqlite_execution(monkeypatch, tmp_path, regions=250):
+def install_isolated_sqlite_execution(monkeypatch, tmp_path, regions=250, stub_compiler=True):
     """Run the real exec_sql path against a temp SQLite file; only the pooled
     connection layer is redirected, read-only checks and row conversion stay real."""
     import sqlbot_xpack  # noqa: F401 — legacy import order, see service.execute_authorized_metric_plan
@@ -326,7 +328,8 @@ def install_isolated_sqlite_execution(monkeypatch, tmp_path, regions=250):
             "sql_fingerprint": "a" * 64, "compiler": "metric-plan-v1",
         }
 
-    monkeypatch.setattr(service, "preview_metric_query_plan", preview)
+    if stub_compiler:
+        monkeypatch.setattr(service, "preview_metric_query_plan", preview)
     return state
 
 
@@ -711,6 +714,8 @@ def test_wire_schema_matches_graph_service():
     )
     root = Path(__file__).resolve().parents[1]
     python = root / "graph-service/.venv/Scripts/python.exe"
+    if not python.exists():
+        python = root / "graph-service/.venv/bin/python"
     if not python.exists():
         pytest.skip("graph-service environment required for cross-environment schema comparison")
     output = subprocess.check_output([str(python), "-c",
@@ -1125,3 +1130,199 @@ def test_chat_routing_returns_none_when_not_whitelisted(configured, monkeypatch)
         enable_graph_engine(monkeypatch)
         assert asyncio.run(chat_stream.maybe_stream_graph_answer(
             session, user, ChatQuestion(chat_id=1, question="q"), in_chat=False)) is None
+
+
+# --- Row permissions on the governed execution path ---
+
+def install_metric_catalog(database):
+    """Published metric + table catalog in the isolated metadata database."""
+    from sqlalchemy.dialects.postgresql import JSONB
+    from sqlbot_xpack.permissions.models.ds_permission import DsPermission
+    from sqlbot_xpack.permissions.models.ds_rules import DsRules
+    from apps.datasource.models.datasource import CoreField, CoreTable
+    from apps.metrics.models.metric import MetricDefinition, MetricVersion
+    metadata = MetaData()
+    # core_datasource already exists; it is listed so the metric foreign key resolves.
+    for model in (CoreDatasource, MetricDefinition, MetricVersion, CoreTable, CoreField,
+                  DsPermission, DsRules):
+        table = model.__table__.to_metadata(metadata)
+        for column in table.columns:
+            if isinstance(column.type, JSONB):
+                column.type = JSON()
+    metadata.create_all(database)
+    with Session(database) as session:
+        session.add(MetricDefinition(id=9, oid=2, code="net_sales", name="Net sales",
+                                     datasource_id=3, owner_user_id=7, status="published",
+                                     current_version_id=27))
+        session.add(MetricVersion(id=27, metric_id=9, version=3, expression="amount",
+                                  aggregation="SUM", required_tables=["orders"],
+                                  dimensions=["region"], status="published",
+                                  validation_status="passed", created_by=7))
+        session.add(CoreTable(id=31, ds_id=3, checked=True, table_name="orders",
+                              table_comment="", custom_comment=""))
+        for index, name in enumerate(("region", "amount")):
+            session.add(CoreField(id=41 + index, ds_id=3, table_id=31, checked=True,
+                                  field_name=name, field_type="text", field_comment="",
+                                  custom_comment="", field_index=index))
+        session.commit()
+
+
+def test_metric_execute_compiles_row_permissions_into_the_executed_query(
+        configured, monkeypatch, tmp_path):
+    import apps.datasource.crud.permission as permission
+    install_metric_catalog(configured)
+    install_isolated_sqlite_execution(monkeypatch, tmp_path, regions=5, stub_compiler=False)
+    claims = {"sub": "7", "workspace": "2", "model_id": 10, "run_id": "run"}
+    plan = execution_plan(limit=None)
+
+    monkeypatch.setattr(permission, "get_row_permission_filters",
+                        lambda **kwargs: [])
+    unrestricted = asyncio.run(service.execute_authorized_metric_plan(claims, "q", 3, plan))
+    assert unrestricted["row_count"] == 5
+
+    seen = []
+
+    def rules(*, session, current_user, ds, tables):
+        # The legacy renderer receives the real caller and the metric's catalog table.
+        seen.append((current_user.id, ds.id, tables))
+        return [{"table": "orders", "filter": "(\"region\" IN ('region-1', 'region-3'))"}]
+
+    monkeypatch.setattr(permission, "get_row_permission_filters", rules)
+    restricted = asyncio.run(service.execute_authorized_metric_plan(claims, "q", 3, plan))
+    assert seen == [(7, 3, ["orders"])]
+    assert restricted["rows"] == [{"region": "region-1", "net_sales": 1},
+                                  {"region": "region-3", "net_sales": 3}]
+    assert restricted["sql_fingerprint"] != unrestricted["sql_fingerprint"]
+
+
+def test_metric_compile_refuses_unusable_row_permission_rules(configured, monkeypatch):
+    import apps.datasource.crud.permission as permission
+    install_metric_catalog(configured)
+    monkeypatch.setattr(permission, "get_row_permission_filters", lambda **kwargs: [
+        {"table": "orders", "filter": "region IN (SELECT region FROM secrets)"}])
+    with pytest.raises(HTTPException) as error:
+        service.compile_authorized_metric_plan(
+            {"sub": "7", "workspace": "2", "model_id": 10}, "q", 3, execution_plan())
+    assert error.value.status_code == 403
+
+
+# --- One deadline for the whole run ---
+
+def test_metric_delegation_carries_a_deadline_inside_its_lifetime(configured, monkeypatch):
+    monkeypatch.setattr(settings, "GRAPH_REQUEST_TIMEOUT", 60)
+    body, request = metric_query_body_and_request()
+    claims = security.verify_metric_request(request, body)
+    assert claims["iat"] < claims["deadline"] <= claims["exp"]
+    assert 50 < claims["deadline"] - time.time() <= 58
+    # Oversized budgets are clamped inside the 120-second delegation lifetime.
+    monkeypatch.setattr(settings, "GRAPH_REQUEST_TIMEOUT", 999)
+    assert security.request_budget_seconds() == security.MAX_REQUEST_BUDGET_SECONDS
+
+
+def test_step_timeout_is_bounded_by_the_run_deadline():
+    assert service.step_timeout({}, 30) == 30
+    assert 9 < service.step_timeout({"deadline": time.time() + 10}, 30) <= 10
+    assert service.step_timeout({"deadline": time.time() + 100}, 30) == 30
+    with pytest.raises(HTTPException) as error:
+        service.step_timeout({"deadline": time.time() + 0.1}, 30)
+    assert error.value.status_code == 504 and error.value.detail == "graph_deadline_exceeded"
+
+
+def test_spent_budget_never_starts_a_query_or_a_model_call(configured, monkeypatch, tmp_path):
+    install_isolated_sqlite_execution(monkeypatch, tmp_path)
+    import apps.db.db as db_module
+    monkeypatch.setattr(db_module, "exec_sql", lambda *args: pytest.fail("query started"))
+    claims = {"sub": "7", "workspace": "2", "model_id": 10, "run_id": "run",
+              "deadline": time.time() + 0.1}
+    with pytest.raises(HTTPException) as error:
+        asyncio.run(service.execute_authorized_metric_plan(claims, "q", 3, execution_plan()))
+    assert error.value.detail == "graph_deadline_exceeded"
+    monkeypatch.setattr(service, "authorized_metric_candidates", lambda *args: [metric_candidate()])
+    monkeypatch.setattr(service.LLMFactory, "create_llm", lambda *_: pytest.fail("model invoked"))
+    with pytest.raises(HTTPException) as error:
+        asyncio.run(service.invoke_metric_model(
+            claims, "q", 3, [MetricCandidateRef(metric_id=9, metric_version_id=27)]))
+    assert error.value.detail == "graph_deadline_exceeded"
+
+
+# --- Planning prompt ---
+
+def test_planning_prompt_states_today_and_end_exclusive_ranges(monkeypatch):
+    from apps.graph_gateway.prompts import metric_planning_messages
+    monkeypatch.setattr(settings, "GRAPH_PLANNING_TIMEZONE", "Asia/Shanghai")
+    system, human = metric_planning_messages(
+        "上个月东部净销售额", [metric_candidate()], datetime.datetime(2026, 9, 25, 10, 30))
+    prompt = system.content
+    assert "Current date: 2026-09-25 (星期五), timezone Asia/Shanghai" in prompt
+    assert "END-EXCLUSIVE" in prompt
+    assert '"2026-08-01T00:00:00", end "2026-09-01T00:00:00"' in prompt
+    assert '"metric_code":"net_sales"' in prompt and '"time_field":"ordered_at"' in prompt
+    assert "expression" not in prompt and "api_key" not in prompt
+    assert human.content == "上个月东部净销售额"
+
+
+def test_planning_timezone_misconfiguration_fails_closed(monkeypatch):
+    from apps.graph_gateway.prompts import planning_now
+    monkeypatch.setattr(settings, "GRAPH_PLANNING_TIMEZONE", "Mars/Olympus")
+    with pytest.raises(HTTPException) as error:
+        planning_now()
+    assert error.value.status_code == 503
+
+
+def test_allowlists_tolerate_spaces_and_reject_malformed_entries(configured, monkeypatch):
+    monkeypatch.setattr(settings, "GRAPH_TEST_USERS", " 7 , 8 ")
+    monkeypatch.setattr(settings, "GRAPH_TEST_WORKSPACES", "2, 5")
+    service.authorize_current(7, 2)
+    monkeypatch.setattr(settings, "GRAPH_TEST_USERS", "7,abc")
+    with pytest.raises(HTTPException) as error:
+        service.authorize_current(7, 2)
+    assert error.value.status_code == 503
+
+
+# --- Chat routing follows experiment authorization ---
+
+def test_chat_routing_requires_the_graph_experiment_authorization(configured, monkeypatch):
+    from apps.graph_gateway import chat_stream
+    enable_graph_engine(monkeypatch, workspaces="2, 5")
+    with Session(configured) as session:
+        user = chat_user(session)
+        chat = session.get(Chat, 1)
+    assert chat_stream.graph_engine_enabled(user, chat) is True
+    # A whitelisted workspace does not route users the graph run would reject.
+    monkeypatch.setattr(settings, "GRAPH_TEST_USERS", "8")
+    assert chat_stream.graph_engine_enabled(user, chat) is False
+    monkeypatch.setattr(settings, "GRAPH_TEST_USERS", "7")
+    # A chat from another workspace stays on the legacy engine.
+    assert chat_stream.graph_engine_enabled(user, chat.model_copy(update={"oid": 5})) is False
+
+
+def test_chat_routing_skips_assistants_and_non_streaming_callers(configured, monkeypatch):
+    from apps.graph_gateway import chat_stream
+    enable_graph_engine(monkeypatch)
+    monkeypatch.setattr(chat_stream, "run_metric_query",
+                        lambda *args: pytest.fail("graph engine used"))
+    with Session(configured) as session:
+        user = chat_user(session)
+        question = ChatQuestion(chat_id=1, question="q")
+        assert asyncio.run(chat_stream.maybe_stream_graph_answer(
+            session, user, question, current_assistant=SimpleNamespace(type=4))) is None
+        assert asyncio.run(chat_stream.maybe_stream_graph_answer(
+            session, user, question, stream=False)) is None
+
+
+def test_graph_chat_names_the_conversation_after_its_first_question_only(configured, monkeypatch):
+    from apps.graph_gateway import chat_stream
+    enable_graph_engine(monkeypatch)
+
+    async def fake_run(uid, oid, question, datasource_id):
+        return completed_query_result()
+
+    monkeypatch.setattr(chat_stream, "run_metric_query", fake_run)
+    with Session(configured) as session:
+        user = chat_user(session)
+        for question in ("八月东部净销售额", "那西部呢"):
+            response = asyncio.run(chat_stream.maybe_stream_graph_answer(
+                session, user, ChatQuestion(chat_id=1, question=question)))
+            _, events = collect_sse(response)
+            assert ("brief" in [event["type"] for event in events]) is (question == "八月东部净销售额")
+        assert session.get(Chat, 1).brief == "八月东部净销售额"

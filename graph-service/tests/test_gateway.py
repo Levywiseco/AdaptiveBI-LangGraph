@@ -159,6 +159,7 @@ def metric_experiment(monkeypatch):
         "sub": "7", "workspace": "2", "model_id": 10,
         "scope": ["metrics:read", "model:invoke", "metric:compile"],
         "purpose": "metric-plan", "iat": int(time.time()), "exp": int(time.time()) + 120,
+        "deadline": time.time() + 60,
         "datasource_id": 3, "run_id": body["run_id"],
         "request_hash": hashlib.sha256(("3\n" + body["question"]).encode()).hexdigest(),
     }

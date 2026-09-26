@@ -1,4 +1,7 @@
-"""Strict metric-plan contracts; metric formulas remain in the business gateway."""
+"""Strict metric-plan contracts; metric formulas remain in the business gateway.
+
+The planning prompt is built only by the backend gateway (apps/graph_gateway/prompts.py).
+"""
 
 import json
 from datetime import datetime
@@ -69,24 +72,6 @@ class MetricPlanningError(ValueError):
     def __init__(self, code: str):
         self.code = code
         super().__init__(code)
-
-
-def planning_prompt(question: str, candidates: list[MetricCandidate]) -> list[dict[str, str]]:
-    """Return a provider-neutral prompt without formulas or connection details."""
-    catalog = [candidate.model_dump(mode="json") for candidate in candidates]
-    return [
-        {
-            "role": "system",
-            "content": (
-                "Select exactly one authorized metric and return one JSON object only. "
-                "Use only the candidate metric/version IDs, dimensions and time field. "
-                "Do not write SQL or invent fields. Use start-inclusive, end-exclusive time ranges. "
-                "Required keys: metric_id, metric_version_id, dimensions, filters, time_range, limit. "
-                "Authorized candidates: " + json.dumps(catalog, ensure_ascii=False, separators=(",", ":"))
-            ),
-        },
-        {"role": "user", "content": question},
-    ]
 
 
 def parse_metric_plan(raw: str, candidates: list[MetricCandidate]) -> MetricQueryPlan:

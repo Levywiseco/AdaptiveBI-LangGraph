@@ -11,12 +11,9 @@ from sqlmodel import Session, select
 
 from apps.ai_model.model_factory import LLMFactory, get_default_config
 from apps.datasource.models.datasource import CoreDatasource
-from apps.system.crud.aimodel_manage import get_ai_model_list_by_workspace
-from apps.system.models.system_model import AiModelDetail, UserWsModel, WorkspaceModel
-from apps.system.models.user import UserModel
-from common.core.config import settings
-from common.core.db import engine
 from apps.graph_gateway.contracts import MetricQueryResponse
+from apps.graph_gateway.model_policy import gateway_model_config
+from apps.graph_gateway.prompts import metric_planning_messages, planning_now
 from apps.graph_gateway.security import (
     configured_ids,
     enabled,
@@ -24,24 +21,23 @@ from apps.graph_gateway.security import (
     metric_datasource_enabled,
     request_budget_seconds,
 )
-from apps.graph_gateway.model_policy import gateway_model_config
-from apps.graph_gateway.prompts import metric_planning_messages, planning_now
 from apps.metrics.crud.metric import get_metric_candidates
 from apps.metrics.schemas.metric import MetricQueryPlanRequest
 from apps.metrics.service.dimension_values import planning_dimension_values
 from apps.metrics.service.query_planner import preview_metric_query_plan
+from apps.system.crud.aimodel_manage import get_ai_model_list_by_workspace
+from apps.system.models.system_model import AiModelDetail, UserWsModel, WorkspaceModel
+from apps.system.models.user import UserModel
 from apps.system.schemas.system_schema import UserInfoDTO
+from common.core.config import settings
+from common.core.db import engine
 
 MODEL_SLOTS = asyncio.Semaphore(4)
 EXECUTION_SLOTS = asyncio.Semaphore(4)
 PLAN_KEYS = {"metric_id", "metric_version_id", "dimensions", "filters", "time_range", "limit"}
 MODEL_STEP_SECONDS = 30
 MIN_STEP_SECONDS = 0.5
-SCHEMA = (
-    "sales(id INTEGER, month TEXT, region TEXT, gross INTEGER, refund INTEGER); net = gross - refund. "
-    "month stores YYYY-MM text, for example '2026-08' (August 2026), not full dates. "
-    "region stores 'east' (East / 东部) or 'west' (West / 西部)."
-)
+
 
 
 def authorize_current(uid: int, oid: int):
@@ -136,8 +132,8 @@ def authorized_metric_candidates(claims, question: str, datasource_id: int, cont
                                        recall=get_metric_candidates)
 
 
-async def invoke_metric_model(claims, question: str, datasource_id: int, candidate_refs,
-                              context=(), repairs=()):
+def _planning_snapshot(claims, question: str, datasource_id: int, candidate_refs, context):
+    """Authorize, revalidate the candidate refs and load known values (blocking DB work)."""
     candidates = authorized_metric_candidates(claims, question, datasource_id, context)
     requested = {(item.metric_id, item.metric_version_id) for item in candidate_refs}
     if len(requested) != len(candidate_refs):
@@ -151,6 +147,16 @@ async def invoke_metric_model(claims, question: str, datasource_id: int, candida
         known_values = planning_dimension_values(
             session, selected, _current_user(session, uid, oid), datasource_id
         )
+    return selected, known_values
+
+
+async def invoke_metric_model(claims, question: str, datasource_id: int, candidate_refs,
+                              context=(), repairs=()):
+    # Database work runs off the event loop, which also serves the waiting user request.
+    selected, known_values = await asyncio.to_thread(
+        _planning_snapshot, claims, question, datasource_id, candidate_refs, context
+    )
+    uid, oid = int(claims["sub"]), int(claims["workspace"])
     prompt_candidates = [
         {**item, "dimension_values": known_values[item["metric_version_id"]]}
         if item["metric_version_id"] in known_values else item
@@ -174,12 +180,12 @@ async def invoke_metric_model(claims, question: str, datasource_id: int, candida
         config, policy = gateway_model_config(config)
         provider_family = policy.family
         model = LLMFactory.create_llm(config).llm
-        authorize_current(uid, oid)
         timeout = step_timeout(claims, MODEL_STEP_SECONDS)
         calls = 1
         message = await asyncio.wait_for(model.ainvoke(messages), timeout=timeout)
         usage = usage_from(message)
-        authorize_current(uid, oid)
+        # Access may be revoked during a long provider call; do not release its output then.
+        await asyncio.to_thread(authorize_current, uid, oid)
         content = message.content
         if not isinstance(content, str) or not content.strip() or len(content) > 16000:
             return {"error": "model_output_invalid", "usage": usage, "model_calls": calls}
@@ -229,7 +235,6 @@ def compile_authorized_metric_plan(claims, question: str, datasource_id: int, pl
     with Session(engine) as session:
         current_user = _current_user(session, uid, oid)
         compiled = preview_metric_query_plan(session, metric_id, payload, oid, current_user)
-    authorize_current(uid, oid)
     if compiled["datasource_id"] != datasource_id or compiled["metric_version_id"] != version_id:
         raise HTTPException(403, "metric_not_authorized")
     return {key: compiled.get(key) for key in (
@@ -238,12 +243,7 @@ def compile_authorized_metric_plan(claims, question: str, datasource_id: int, pl
     )}
 
 
-async def execute_authorized_metric_plan(claims, question: str, datasource_id: int, plan: dict):
-    """Compile the published version again, then run one read-only bounded query.
-
-    SQL never leaves this process: the graph service only supplies the validated plan.
-    """
-    metric_id, version_id, payload = _validated_plan_request(plan)
+def _compile_for_execution(claims, datasource_id: int, metric_id: int, version_id: int, payload):
     uid, oid = int(claims["sub"]), int(claims["workspace"])
     authorize_current(uid, oid)
     with Session(engine) as session:
@@ -255,6 +255,18 @@ async def execute_authorized_metric_plan(claims, question: str, datasource_id: i
     if (compiled["datasource_id"] != datasource_id or compiled["metric_version_id"] != version_id
             or not datasource or datasource.oid != oid):
         raise HTTPException(403, "metric_not_authorized")
+    return compiled, datasource
+
+
+async def execute_authorized_metric_plan(claims, question: str, datasource_id: int, plan: dict):
+    """Compile the published version again, then run one read-only bounded query.
+
+    SQL never leaves this process: the graph service only supplies the validated plan.
+    """
+    metric_id, version_id, payload = _validated_plan_request(plan)
+    compiled, datasource = await asyncio.to_thread(
+        _compile_for_execution, claims, datasource_id, metric_id, version_id, payload
+    )
     # Never start a query the caller can no longer wait for.
     timeout = step_timeout(claims, settings.GRAPH_METRIC_EXECUTION_TIMEOUT)
     try:
@@ -268,6 +280,7 @@ async def execute_authorized_metric_plan(claims, question: str, datasource_id: i
             # main.py loads sqlbot_xpack first in production; keep that order here
             # so the legacy circular import inside apps.system.crud.assistant resolves.
             import sqlbot_xpack  # noqa: F401
+
             from apps.db.db import exec_sql
             # exec_sql rejects non-read statements; the worker thread cannot be cancelled
             # on timeout, so the overrun is logged instead of silently dropped.
@@ -308,59 +321,6 @@ async def execute_authorized_metric_plan(claims, question: str, datasource_id: i
     }
 
 
-async def invoke_model(claims, question):
-    from langchain_core.messages import HumanMessage, SystemMessage
-    uid, oid = int(claims["sub"]), int(claims["workspace"])
-    authorize_current(uid, oid)
-    try:
-        await asyncio.wait_for(MODEL_SLOTS.acquire(), timeout=0.2)
-    except asyncio.TimeoutError:
-        raise HTTPException(503, "gateway_busy") from None
-    started = perf_counter()
-    calls = 0
-    provider_family = None
-    usage = {"input_tokens": None, "output_tokens": None, "total_tokens": None}
-    try:
-        config = await get_default_config(settings.GRAPH_MODEL_ID)
-        if config.model_id != claims["model_id"]:
-            raise HTTPException(403, "model_not_allowed")
-        # Apply a bounded provider policy instead of forwarding arbitrary saved
-        # request options into this security-sensitive execution path.
-        config, policy = gateway_model_config(config)
-        provider_family = policy.family
-        model = LLMFactory.create_llm(config).llm
-        authorize_current(uid, oid)
-        calls = 1
-        message = await asyncio.wait_for(model.ainvoke([
-            SystemMessage(content="Return exactly one SQLite SELECT statement, no markdown, comments or explanation. "
-                                  "Only this synthetic schema is available: " + SCHEMA),
-            HumanMessage(content=question),
-        ]), timeout=30)
-        usage = usage_from(message)
-        authorize_current(uid, oid)
-        content = message.content
-        if not isinstance(content, str) or not content.strip() or len(content) > 16000:
-            return {"error": "model_output_invalid", "usage": usage, "model_calls": calls}
-        return {"content": content, "usage": usage, "model_calls": calls,
-                "elapsed_ms": round((perf_counter() - started) * 1000, 2)}
-    except HTTPException:
-        raise
-    except (asyncio.TimeoutError, TimeoutError):
-        return {"error": "model_timeout", "usage": usage, "model_calls": calls}
-    except Exception as exc:
-        # SDK timeouts can use provider-specific exception classes.
-        error = "model_timeout" if "timeout" in type(exc).__name__.lower() else "model_call_failed"
-        return {"error": error, "usage": usage, "model_calls": calls}
-    finally:
-        logging.getLogger("adaptive.graph_gateway").info("graph_model_usage %s", json.dumps({
-            "run_id": claims.get("run_id"), "model_config_id": claims["model_id"],
-            "provider_family": provider_family,
-            "model_calls": calls, "usage": usage,
-            "elapsed_ms": round((perf_counter() - started) * 1000, 2),
-        }))
-        MODEL_SLOTS.release()
-
-
 async def run_metric_query(uid: int, oid: int, question: str, datasource_id: int,
                            context=()) -> MetricQueryResponse:
     """Plan and execute one governed metric query through the graph service.
@@ -369,7 +329,7 @@ async def run_metric_query(uid: int, oid: int, question: str, datasource_id: int
     an explicit allowlist so leaked internal fields cannot pass through.
     """
     metric_datasource_enabled(datasource_id)
-    authorize_current(uid, oid)
+    await asyncio.to_thread(authorize_current, uid, oid)
     run_id = uuid4()
     token = issue_metric_query_delegation(uid, oid, run_id, question, datasource_id, context)
     try:
@@ -392,7 +352,7 @@ async def run_metric_query(uid: int, oid: int, question: str, datasource_id: int
         })
         if result.run_id != run_id:
             raise ValueError("run_mismatch")
-        authorize_current(uid, oid)
+        await asyncio.to_thread(authorize_current, uid, oid)
         return result
     except HTTPException:
         raise

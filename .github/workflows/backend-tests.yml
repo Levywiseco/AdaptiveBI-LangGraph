@@ -1,0 +1,48 @@
+name: Backend tests
+on:
+  pull_request:
+    paths: ['backend/**', 'tests/**', 'graph-service/**', 'evaluations/**', 'scripts/export-backend-test-requirements.py', '.github/workflows/backend-tests.yml']
+  push:
+    branches: [main, 'codex/**']
+    paths: ['backend/**', 'tests/**', 'graph-service/**', 'evaluations/**', 'scripts/export-backend-test-requirements.py', '.github/workflows/backend-tests.yml']
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      # Legacy settings create these directories on import; keep them in the workspace.
+      BASE_DIR: ${{ github.workspace }}/.ci-data
+      UPLOAD_DIR: ${{ github.workspace }}/.ci-data/data/file
+      EXCEL_PATH: ${{ github.workspace }}/.ci-data/data/excel
+      MCP_IMAGE_PATH: ${{ github.workspace }}/.ci-data/images
+      LOG_DIR: ${{ github.workspace }}/.ci-data/logs
+      LOCAL_MODEL_PATH: ${{ github.workspace }}/.ci-data/models
+      EMBEDDING_ENABLED: 'false'
+      TABLE_EMBEDDING_ENABLED: 'false'
+      CACHE_TYPE: memory
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: '0.12.10'
+      - name: Graph service environment (cross-process and wire-schema tests)
+        working-directory: graph-service
+        run: uv sync --locked --python 3.11
+      - name: Backend environment from the lock, hash-checked, without torch
+        run: |
+          python3 scripts/export-backend-test-requirements.py "$RUNNER_TEMP/requirements"
+          uv venv --python 3.11 backend/.venv
+          uv pip install --python backend/.venv/bin/python --no-deps \
+            --index-url https://pypi.org/simple -r "$RUNNER_TEMP/requirements/pypi.txt"
+          uv pip install --python backend/.venv/bin/python --no-deps \
+            --index-url https://test.pypi.org/simple -r "$RUNNER_TEMP/requirements/testpypi.txt"
+      - name: Backend and gateway tests
+        working-directory: backend
+        env:
+          PYTHONPATH: .
+        run: uv run --no-sync pytest ../tests -q
+      - name: Governed metric suite (scripted)
+        working-directory: backend
+        run: uv run --no-sync python ../evaluations/metric_eval.py --mode scripted

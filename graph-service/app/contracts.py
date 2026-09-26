@@ -54,23 +54,6 @@ class RunEvent(BaseModel):
     payload: dict
 
 
-class QuestionRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    question: str = Field(min_length=1, max_length=2000)
-    datasource_id: Literal["synthetic-sales"] = "synthetic-sales"
-
-    @field_validator("question")
-    @classmethod
-    def not_blank(cls, value):
-        if not value.strip():
-            raise ValueError("question_required")
-        return value
-
-
-class InternalQuestion(QuestionRequest):
-    run_id: UUID
-
-
 class MetricQuestionRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     question: str = Field(min_length=1, max_length=2000)
@@ -131,15 +114,6 @@ class SafeResult(BaseModel):
                    "gateway_unavailable", "gateway_rejected", "sql_validation_failed",
                    "datasource_access_denied", "query_execution_failed",
                    "graph_execution_failed"] | None = None
-
-
-class SafeResponse(SafeResult):
-    mode: Literal["synthetic-live"] = "synthetic-live"
-    run_id: UUID
-    model_config_id: int | None = None
-    usage: ModelUsage = Field(default_factory=ModelUsage)
-    model_calls: int | None = Field(default=0, ge=0)
-    elapsed_ms: float = Field(default=0, ge=0)
 
 
 class MetricPlanResponse(BaseModel):

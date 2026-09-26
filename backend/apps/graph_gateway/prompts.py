@@ -18,6 +18,7 @@ _WEEKDAYS = ["星期一", "星期二", "星期三", "星期四", "星期五", "�
 _RULES = """You translate one business question into a governed metric query plan.
 Return exactly one JSON object and nothing else: no markdown, no code fences, no SQL, no explanation.
 Required keys: metric_id, metric_version_id, dimensions, filters, time_range, limit.
+The only alternative is a clarification object, see rule 6.
 
 Rules:
 1. metric_id and metric_version_id must be copied together from one candidate below.
@@ -40,7 +41,12 @@ Rules:
      start is N-1 days before today at 00:00, end is tomorrow at 00:00.
    - A month or quarter named without a year means the most recent one that has already started.
 5. limit: null unless the question asks for the top/bottom N rows.
-
+6. Instead of a plan you may return {{"clarification": "<one short question for the user>", "reason": ...}}
+   written in the user's language:
+   - "unsupported" when no candidate measures what is asked (for example profit when only revenue exists);
+   - "ambiguous" when two or more candidates fit about equally well and the question gives no way to choose.
+   Do not ask when a reasonable default exists: no period means time_range null, no grouping means no dimensions.
+{conversation}
 Current date: {today} ({weekday}), timezone {timezone}.
 Example output: {example}
 Authorized candidates: {candidates}"""
@@ -60,14 +66,41 @@ def planning_now() -> datetime:
     return datetime.now(zone).replace(tzinfo=None)
 
 
-def metric_planning_messages(question: str, candidates: list[dict], now: datetime):
-    from langchain_core.messages import HumanMessage, SystemMessage
+# Explanations the model sees when its previous reply was rejected (bounded repair).
+REPAIR_HINTS = {
+    "metric_plan_invalid": "it was not one JSON object with exactly the required keys and valid values",
+    "metric_not_authorized": "metric_id and metric_version_id must be copied together from one candidate",
+    "metric_dimension_not_allowed": "dimensions must come from the chosen candidate's dimensions",
+    "metric_filter_not_allowed": "filter fields must be the chosen candidate's dimensions or its time_field",
+    "metric_time_range_not_allowed": "the chosen candidate has no time_field, so time_range must be null",
+    "metric_compile_failed": "the plan could not be compiled; check field names, operators and value types",
+}
+
+
+def _conversation(context: list[str]) -> str:
+    if not context:
+        return ""
+    earlier = "\n".join(f"   {index}. {item}" for index, item in enumerate(context, start=1))
+    return ("7. This is a follow-up. Earlier questions in the conversation, oldest first:\n" + earlier + "\n"
+            "   Keep the earlier metric, dimensions, filters and period unless the current question changes them.\n")
+
+
+def metric_planning_messages(question: str, candidates: list[dict], now: datetime,
+                             context: list[str] = (), repairs: list[dict] = ()):
+    from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
     system = _RULES.format(
+        conversation=_conversation(list(context)),
         today=now.date().isoformat(),
         weekday=_WEEKDAYS[now.weekday()],
         timezone=settings.GRAPH_PLANNING_TIMEZONE,
         example=_EXAMPLE,
         candidates=json.dumps(candidates, ensure_ascii=False, separators=(",", ":")),
     )
-    return [SystemMessage(content=system), HumanMessage(content=question)]
+    messages = [SystemMessage(content=system), HumanMessage(content=question)]
+    for repair in repairs:
+        messages.append(AIMessage(content=repair["previous"]))
+        messages.append(HumanMessage(content=(
+            f"That reply was rejected ({repair['error']}): {REPAIR_HINTS[repair['error']]}. "
+            "Reply again with one corrected JSON object.")))
+    return messages

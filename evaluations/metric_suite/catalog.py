@@ -193,6 +193,8 @@ class Case:
     filters: list[dict[str, Any]] = field(default_factory=list)
     time_range: Optional[dict[str, str]] = None
     note: str = ""
+    # Earlier questions of the same conversation, oldest first.
+    context: list[str] = field(default_factory=list)
 
     def gold_plan(self) -> Optional[dict[str, Any]]:
         if self.metric is None:
@@ -283,9 +285,18 @@ CASES = [
          note="只有语义召回能找到"),
     Case("syn-refund-paraphrase", "synonym", "上个月退了多少钱", "refund_amount", time_range=AUG,
          note="只有语义召回能找到"),
-    # Outside the catalog
+    # Follow-ups that only make sense with the earlier question
+    Case("follow-month", "follow_up", "那7月呢？", "net_sales", ["region"],
+         time_range=period("2026-07-01", "2026-08-01"), context=["8月各区域的净销售额"]),
+    Case("follow-filter", "follow_up", "只看线上渠道", "order_count",
+         filters=[eq("channel", "online")], time_range=AUG, context=["上个月的订单数"]),
+    Case("follow-metric-switch", "follow_up", "换成订单数看看", "order_count", ["region"],
+         time_range=AUG, context=["8月各区域的净销售额"]),
+    # Outside the catalog or ambiguous: the planner must not guess
     Case("refuse-margin", "refusal", "上个月的毛利率是多少", None),
     Case("refuse-inventory", "refusal", "各仓库现在的库存量", None),
+    Case("clarify-sales", "refusal", "上个月卖了多少钱", None,
+         note="成交总额与净销售额都说得通，应追问而不是猜"),
 ]
 
 

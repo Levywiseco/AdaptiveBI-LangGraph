@@ -9,6 +9,7 @@ cases:
 - id: basic-gmv-total
   category: basic
   question: 总的成交总额是多少？
+  context: []
   gold:
     metric: gmv
     dimensions: []
@@ -22,6 +23,7 @@ cases:
 - id: basic-orders-aug
   category: basic
   question: 2026年8月的订单数
+  context: []
   gold:
     metric: order_count
     dimensions: []
@@ -37,6 +39,7 @@ cases:
 - id: basic-net-sales-dec
   category: basic
   question: 2025年12月净销售额是多少
+  context: []
   gold:
     metric: net_sales
     dimensions: []
@@ -52,6 +55,7 @@ cases:
 - id: basic-cancelled-aug
   category: basic
   question: 2026年8月有多少取消订单数
+  context: []
   gold:
     metric: cancelled_orders
     dimensions: []
@@ -67,6 +71,7 @@ cases:
 - id: abs-month-without-year
   category: time_absolute
   question: 8月的销量
+  context: []
   gold:
     metric: units_sold
     dimensions: []
@@ -83,6 +88,7 @@ cases:
 - id: abs-past-month-without-year
   category: time_absolute
   question: 11月的成交总额
+  context: []
   gold:
     metric: gmv
     dimensions: []
@@ -99,6 +105,7 @@ cases:
 - id: abs-year
   category: time_absolute
   question: 2025年的退款金额
+  context: []
   gold:
     metric: refund_amount
     dimensions: []
@@ -114,6 +121,7 @@ cases:
 - id: abs-quarter
   category: time_absolute
   question: 2026年第二季度的下单客户数
+  context: []
   gold:
     metric: buyer_count
     dimensions: []
@@ -129,6 +137,7 @@ cases:
 - id: abs-day
   category: time_absolute
   question: 2026年9月1日的订单数
+  context: []
   gold:
     metric: order_count
     dimensions: []
@@ -144,6 +153,7 @@ cases:
 - id: abs-month-range
   category: time_absolute
   question: 2026年7月到8月的优惠金额
+  context: []
   gold:
     metric: discount_total
     dimensions: []
@@ -159,6 +169,7 @@ cases:
 - id: rel-last-month
   category: time_relative
   question: 上个月的净销售额
+  context: []
   gold:
     metric: net_sales
     dimensions: []
@@ -174,6 +185,7 @@ cases:
 - id: rel-this-month
   category: time_relative
   question: 本月成交总额是多少
+  context: []
   gold:
     metric: gmv
     dimensions: []
@@ -189,6 +201,7 @@ cases:
 - id: rel-last-7-days
   category: time_relative
   question: 近7天的订单数
+  context: []
   gold:
     metric: order_count
     dimensions: []
@@ -204,6 +217,7 @@ cases:
 - id: rel-last-30-days
   category: time_relative
   question: 近30天的下单客户数
+  context: []
   gold:
     metric: buyer_count
     dimensions: []
@@ -219,6 +233,7 @@ cases:
 - id: rel-last-week
   category: time_relative
   question: 上周的销量
+  context: []
   gold:
     metric: units_sold
     dimensions: []
@@ -234,6 +249,7 @@ cases:
 - id: rel-yesterday
   category: time_relative
   question: 昨天的成交总额
+  context: []
   gold:
     metric: gmv
     dimensions: []
@@ -249,6 +265,7 @@ cases:
 - id: rel-this-year
   category: time_relative
   question: 今年以来的下单客户数
+  context: []
   gold:
     metric: buyer_count
     dimensions: []
@@ -264,6 +281,7 @@ cases:
 - id: rel-last-year
   category: time_relative
   question: 去年的取消订单数
+  context: []
   gold:
     metric: cancelled_orders
     dimensions: []
@@ -279,6 +297,7 @@ cases:
 - id: rel-this-quarter
   category: time_relative
   question: 本季度的退款金额
+  context: []
   gold:
     metric: refund_amount
     dimensions: []
@@ -294,6 +313,7 @@ cases:
 - id: rel-last-quarter
   category: time_relative
   question: 上季度的客单价
+  context: []
   gold:
     metric: avg_order_value
     dimensions: []
@@ -309,6 +329,7 @@ cases:
 - id: dim-region
   category: dimension
   question: 8月各区域的净销售额
+  context: []
   gold:
     metric: net_sales
     dimensions:
@@ -332,6 +353,7 @@ cases:
 - id: dim-channel
   category: dimension
   question: 按渠道看上个月的订单数
+  context: []
   gold:
     metric: order_count
     dimensions:
@@ -353,6 +375,7 @@ cases:
 - id: dim-category-year
   category: dimension
   question: 2025年各品类的销量
+  context: []
   gold:
     metric: units_sold
     dimensions:
@@ -374,6 +397,7 @@ cases:
 - id: dim-two
   category: dimension
   question: 8月各区域各品类的成交总额
+  context: []
   gold:
     metric: gmv
     dimensions:
@@ -426,6 +450,7 @@ cases:
 - id: filter-region
   category: filter
   question: 华东地区8月的成交总额
+  context: []
   gold:
     metric: gmv
     dimensions: []
@@ -444,6 +469,7 @@ cases:
 - id: filter-channel-label
   category: filter
   question: 线上渠道上个月的订单数
+  context: []
   gold:
     metric: order_count
     dimensions: []
@@ -463,6 +489,7 @@ cases:
 - id: filter-channel-label-store
   category: filter
   question: 门店渠道今年的净销售额
+  context: []
   gold:
     metric: net_sales
     dimensions: []
@@ -481,6 +508,7 @@ cases:
 - id: filter-in
   category: filter
   question: 华东和华南8月的销量
+  context: []
   gold:
     metric: units_sold
     dimensions: []
@@ -501,6 +529,7 @@ cases:
 - id: filter-not
   category: filter
   question: 除了分销渠道以外，8月的成交总额是多少
+  context: []
   gold:
     metric: gmv
     dimensions: []
@@ -519,6 +548,7 @@ cases:
 - id: filter-with-dimension
   category: filter
   question: 线上渠道8月各区域的订单数
+  context: []
   gold:
     metric: order_count
     dimensions:
@@ -545,6 +575,7 @@ cases:
 - id: filter-category
   category: filter
   question: 家电品类今年的退款金额
+  context: []
   gold:
     metric: refund_amount
     dimensions: []
@@ -563,6 +594,7 @@ cases:
 - id: filter-combined
   category: filter
   question: 2025年第四季度华南地区线上渠道的净销售额
+  context: []
   gold:
     metric: net_sales
     dimensions: []
@@ -584,6 +616,7 @@ cases:
 - id: syn-gmv
   category: synonym
   question: 8月GMV
+  context: []
   gold:
     metric: gmv
     dimensions: []
@@ -599,6 +632,7 @@ cases:
 - id: syn-order-alias
   category: synonym
   question: 上个月单量
+  context: []
   gold:
     metric: order_count
     dimensions: []
@@ -614,6 +648,7 @@ cases:
 - id: syn-buyer-alias
   category: synonym
   question: 8月买家数
+  context: []
   gold:
     metric: buyer_count
     dimensions: []
@@ -629,6 +664,7 @@ cases:
 - id: syn-aov-dimension
   category: synonym
   question: 今年各渠道的AOV
+  context: []
   gold:
     metric: avg_order_value
     dimensions:
@@ -650,6 +686,7 @@ cases:
 - id: syn-buyer-paraphrase
   category: synonym
   question: 上个月下单的客户有多少
+  context: []
   gold:
     metric: buyer_count
     dimensions: []
@@ -666,6 +703,7 @@ cases:
 - id: syn-discount-paraphrase
   category: synonym
   question: 8月一共让利了多少钱
+  context: []
   gold:
     metric: discount_total
     dimensions: []
@@ -682,6 +720,7 @@ cases:
 - id: syn-cancelled-paraphrase
   category: synonym
   question: 8月被取消的订单有几单
+  context: []
   gold:
     metric: cancelled_orders
     dimensions: []
@@ -698,6 +737,7 @@ cases:
 - id: syn-units-paraphrase
   category: synonym
   question: 8月卖出去多少件
+  context: []
   gold:
     metric: units_sold
     dimensions: []
@@ -714,6 +754,7 @@ cases:
 - id: syn-refund-paraphrase
   category: synonym
   question: 上个月退了多少钱
+  context: []
   gold:
     metric: refund_amount
     dimensions: []
@@ -727,15 +768,95 @@ cases:
     rows:
     - refund_amount: 10187.45
   note: 只有语义召回能找到
+- id: follow-month
+  category: follow_up
+  question: 那7月呢？
+  context:
+  - 8月各区域的净销售额
+  gold:
+    metric: net_sales
+    dimensions:
+    - region
+    filters: []
+    time_range:
+      start: '2026-07-01T00:00:00'
+      end: '2026-08-01T00:00:00'
+    limit: null
+  expected:
+    outcome: success
+    rows:
+    - region: 华东
+      net_sales: 22201.25
+    - region: 华北
+      net_sales: 14018.43
+    - region: 华南
+      net_sales: 6099.35
+    - region: 西南
+      net_sales: 11485.22
+- id: follow-filter
+  category: follow_up
+  question: 只看线上渠道
+  context:
+  - 上个月的订单数
+  gold:
+    metric: order_count
+    dimensions: []
+    filters:
+    - field: channel
+      operator: '='
+      value: online
+    time_range:
+      start: '2026-08-01T00:00:00'
+      end: '2026-09-01T00:00:00'
+    limit: null
+  expected:
+    outcome: success
+    rows:
+    - order_count: 27
+- id: follow-metric-switch
+  category: follow_up
+  question: 换成订单数看看
+  context:
+  - 8月各区域的净销售额
+  gold:
+    metric: order_count
+    dimensions:
+    - region
+    filters: []
+    time_range:
+      start: '2026-08-01T00:00:00'
+      end: '2026-09-01T00:00:00'
+    limit: null
+  expected:
+    outcome: success
+    rows:
+    - region: 华东
+      order_count: 22
+    - region: 华北
+      order_count: 9
+    - region: 华南
+      order_count: 16
+    - region: 西南
+      order_count: 9
 - id: refuse-margin
   category: refusal
   question: 上个月的毛利率是多少
+  context: []
   gold: null
   expected:
     outcome: refusal
 - id: refuse-inventory
   category: refusal
   question: 各仓库现在的库存量
+  context: []
   gold: null
   expected:
     outcome: refusal
+- id: clarify-sales
+  category: refusal
+  question: 上个月卖了多少钱
+  context: []
+  gold: null
+  expected:
+    outcome: refusal
+  note: 成交总额与净销售额都说得通，应追问而不是猜

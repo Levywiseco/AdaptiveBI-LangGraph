@@ -30,7 +30,7 @@ The adapter that calls a configured SQLBot instance will be added when a test mo
 `metric_suite/` is a fictional sales catalog for the governed metric path:
 
 - 937 orders in `sales_orders.csv` and 9 published metrics
-- 43 questions in `cases.yaml`, covering plain metrics, absolute and relative periods, dimensions, dimension-value filters (channel codes with Chinese labels), synonyms or paraphrases, and refusals
+- 47 questions in `cases.yaml`, covering plain metrics, absolute and relative periods, dimensions, dimension-value filters (channel codes with Chinese labels), synonyms or paraphrases, follow-ups with conversation context, and refusals or clarifications
 
 Edit `metric_suite/catalog.py` and run `python metric_suite/build.py` to regenerate. Each case's expected rows come from a plain-Python oracle applied to its gold plan, independently of the SQL compiler.
 

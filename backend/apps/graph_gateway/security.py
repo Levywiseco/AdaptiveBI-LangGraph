@@ -1,5 +1,6 @@
 import hashlib
 import hmac
+import json
 import time
 
 import jwt
@@ -26,8 +27,12 @@ def enabled():
         raise HTTPException(503, "gateway_configuration_required")
 
 
-def fingerprint(question, datasource_id):
-    return hashlib.sha256((str(datasource_id) + "\n" + question).encode()).hexdigest()
+def fingerprint(question, datasource_id, context=()):
+    """Request hash signed into the delegation; conversation context is bound too."""
+    payload = str(datasource_id) + "\n" + question
+    if context:
+        payload += "\n" + json.dumps(list(context), ensure_ascii=False)
+    return hashlib.sha256(payload.encode()).hexdigest()
 
 
 def configured_ids(raw: str) -> set[int]:
@@ -61,17 +66,17 @@ def issue_delegation(uid, oid, run_id, question, datasource_id):
                       settings.GRAPH_DELEGATION_SECRET, algorithm="HS256")
 
 
-def issue_metric_delegation(uid, oid, run_id, question, datasource_id):
-    return _issue_metric_delegation(uid, oid, run_id, question, datasource_id,
+def issue_metric_delegation(uid, oid, run_id, question, datasource_id, context=()):
+    return _issue_metric_delegation(uid, oid, run_id, question, datasource_id, context,
                                     purpose="metric-plan", scope=METRIC_SCOPES)
 
 
-def issue_metric_query_delegation(uid, oid, run_id, question, datasource_id):
-    return _issue_metric_delegation(uid, oid, run_id, question, datasource_id,
+def issue_metric_query_delegation(uid, oid, run_id, question, datasource_id, context=()):
+    return _issue_metric_delegation(uid, oid, run_id, question, datasource_id, context,
                                     purpose="metric-query", scope=METRIC_QUERY_SCOPES)
 
 
-def _issue_metric_delegation(uid, oid, run_id, question, datasource_id, purpose, scope):
+def _issue_metric_delegation(uid, oid, run_id, question, datasource_id, context, purpose, scope):
     metric_datasource_enabled(datasource_id)
     now = int(time.time())
     # One absolute deadline for the whole run; every hop derives its timeout from it.
@@ -80,7 +85,7 @@ def _issue_metric_delegation(uid, oid, run_id, question, datasource_id, purpose,
                        "sub": str(uid), "workspace": str(oid), "run_id": str(run_id),
                        "model_id": settings.GRAPH_MODEL_ID, "datasource_id": datasource_id,
                        "scope": scope, "purpose": purpose,
-                       "request_hash": fingerprint(question, datasource_id),
+                       "request_hash": fingerprint(question, datasource_id, context),
                        "deadline": deadline, "iat": now, "exp": now + 120},
                       settings.GRAPH_DELEGATION_SECRET, algorithm="HS256")
 
@@ -132,7 +137,8 @@ def verify_metric_request(request: Request, body, purposes=frozenset(METRIC_PURP
                  and claims["run_id"] == str(body.run_id)
                  and type(claims["model_id"]) is int
                  and claims["model_id"] == settings.GRAPH_MODEL_ID
-                 and claims["request_hash"] == fingerprint(body.question, body.datasource_id)
+                 and claims["request_hash"] == fingerprint(body.question, body.datasource_id,
+                                                           body.context)
                  and 0 < claims["exp"] - claims["iat"] <= 120
                  and type(claims["deadline"]) in (int, float)
                  and claims["iat"] < claims["deadline"] <= claims["exp"]

@@ -67,6 +67,7 @@ class BusinessGateway(BaseModel):
     deadline: float | None = Field(default=None, exclude=True)
     _usage: ModelUsage = PrivateAttr(default_factory=ModelUsage)
     _calls: int | None = PrivateAttr(default=0)
+    _planning_calls: int = PrivateAttr(default=0)
 
     @property
     def usage(self) -> ModelUsage:
@@ -148,19 +149,35 @@ class BusinessGateway(BaseModel):
         except ValidationError:
             raise ModelCallError("gateway_unavailable") from None
 
-    def plan(self, candidates: list[MetricCandidate]) -> str:
+    def _add_usage(self, usage: ModelUsage) -> None:
+        """Sum usage over repair calls; an unknown count makes the total unknown."""
+        if self._planning_calls == 0:
+            self._usage = usage
+            return
+        self._usage = ModelUsage(**{
+            key: None if getattr(self._usage, key) is None or getattr(usage, key) is None
+            else getattr(self._usage, key) + getattr(usage, key)
+            for key in ("input_tokens", "output_tokens", "total_tokens")
+        })
+
+    def plan(self, candidates: list[MetricCandidate], repairs: list[dict] | None = None) -> str:
         refs = [
             {"metric_id": item.metric_id, "metric_version_id": item.metric_version_id}
             for item in candidates
         ]
-        self._calls = None
-        payload = self._request("/internal/graph/metrics/model", {"candidates": refs})
+        previous_calls = self._calls
+        self._calls = None  # unknown until the gateway answers
+        payload = self._request("/internal/graph/metrics/model",
+                                {"candidates": refs, "repairs": list(repairs or [])})
         try:
-            self._usage = ModelUsage.model_validate(payload.get("usage") or {})
+            usage = ModelUsage.model_validate(payload.get("usage") or {})
             calls = payload.get("model_calls")
             if calls is not None and (type(calls) is not int or calls < 0):
                 raise ValueError("invalid_calls")
-            self._calls = calls
+            self._add_usage(usage)
+            self._calls = (None if calls is None or previous_calls is None
+                           else previous_calls + calls)
+            self._planning_calls += 1
         except (ValidationError, ValueError):
             raise ModelCallError("model_output_invalid") from None
         if payload.get("error"):

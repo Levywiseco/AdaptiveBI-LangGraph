@@ -9,7 +9,6 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-
 FilterOperator = Literal[
     "=", "!=", ">", ">=", "<", "<=", "in", "not_in", "between",
     "like", "not_like", "is_null", "is_not_null",
@@ -68,20 +67,66 @@ class MetricQueryPlan(BaseModel):
     limit: int | None = Field(default=None, ge=1, le=10000)
 
 
+class MetricClarification(BaseModel):
+    """The model's alternative to a plan: ask the user instead of guessing."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    clarification: str = Field(min_length=1, max_length=300)
+    reason: Literal["ambiguous", "unsupported"]
+
+
 class MetricPlanningError(ValueError):
     def __init__(self, code: str):
         self.code = code
         super().__init__(code)
 
 
-def parse_metric_plan(raw: str, candidates: list[MetricCandidate]) -> MetricQueryPlan:
-    """Validate model output against the exact authorized candidate snapshot."""
+# Rejections the model can fix when told what was wrong; permission and
+# gateway failures are never retried.
+REPAIRABLE_ERRORS = frozenset({
+    "metric_plan_invalid", "metric_not_authorized", "metric_dimension_not_allowed",
+    "metric_filter_not_allowed", "metric_time_range_not_allowed", "metric_compile_failed",
+})
+PLAN_KEYS = frozenset({"metric_id", "metric_version_id", "dimensions", "filters", "time_range", "limit"})
+
+
+def _load_reply(raw: str) -> dict:
     if not isinstance(raw, str) or not raw.strip() or len(raw) > 16000 or "```" in raw:
         raise MetricPlanningError("metric_plan_invalid")
     try:
         parsed = json.loads(raw)
-        required = {"metric_id", "metric_version_id", "dimensions", "filters", "time_range", "limit"}
-        if not isinstance(parsed, dict) or set(parsed) != required:
+    except ValueError as exc:
+        raise MetricPlanningError("metric_plan_invalid") from exc
+    if not isinstance(parsed, dict):
+        raise MetricPlanningError("metric_plan_invalid")
+    return parsed
+
+
+def parse_model_reply(
+    raw: str, candidates: list[MetricCandidate]
+) -> MetricQueryPlan | MetricClarification:
+    """A validated plan, or a clarification question for the user."""
+    parsed = _load_reply(raw)
+    if set(parsed) == {"clarification", "reason"}:
+        try:
+            clarification = MetricClarification.model_validate(parsed)
+        except Exception as exc:
+            raise MetricPlanningError("metric_plan_invalid") from exc
+        if not clarification.clarification.strip():
+            raise MetricPlanningError("metric_plan_invalid")
+        return clarification
+    return _validated_plan(parsed, candidates)
+
+
+def parse_metric_plan(raw: str, candidates: list[MetricCandidate]) -> MetricQueryPlan:
+    """Validate model output against the exact authorized candidate snapshot."""
+    return _validated_plan(_load_reply(raw), candidates)
+
+
+def _validated_plan(parsed: dict, candidates: list[MetricCandidate]) -> MetricQueryPlan:
+    try:
+        if set(parsed) != PLAN_KEYS:
             raise ValueError("metric_plan_keys_invalid")
         plan = MetricQueryPlan.model_validate(parsed)
     except Exception as exc:

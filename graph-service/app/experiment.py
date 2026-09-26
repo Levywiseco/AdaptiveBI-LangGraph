@@ -1,5 +1,6 @@
 import hashlib
 import hmac
+import json
 import os
 from time import perf_counter
 
@@ -18,7 +19,7 @@ from app.contracts import (
     SafeResponse,
 )
 from app.graph import build_graph
-from app.metric_graph import build_metric_graph
+from app.metric_graph import build_metric_graph, recursion_limit
 from app.synthetic import SyntheticTools
 
 router = APIRouter()
@@ -92,9 +93,10 @@ def verify_metric(request, body, purposes=frozenset(METRIC_PURPOSE_SCOPES)):
                 "request_hash", "datasource_id", "deadline", "iat", "exp",
             ]},
         )
-        expected_hash = hashlib.sha256(
-            (str(body.datasource_id) + "\n" + body.question).encode()
-        ).hexdigest()
+        payload = str(body.datasource_id) + "\n" + body.question
+        if body.context:
+            payload += "\n" + json.dumps(list(body.context), ensure_ascii=False)
+        expected_hash = hashlib.sha256(payload.encode()).hexdigest()
         purpose = claims.get("purpose")
         valid = (
             purpose in METRIC_PURPOSE_SCOPES
@@ -168,7 +170,7 @@ def metric_plan(body: InternalMetricQuestion, request: Request):
     try:
         state = graph.invoke(
             {"question": body.question, "datasource_id": body.datasource_id},
-            {"recursion_limit": 12},
+            {"recursion_limit": recursion_limit()},
         )
     except Exception:
         state = {"status": "failed", "error": "graph_execution_failed"}
@@ -177,7 +179,8 @@ def metric_plan(body: InternalMetricQuestion, request: Request):
         for key in (
             "status", "error", "metric_id", "metric_code", "metric_name",
             "metric_version_id", "metric_version", "dimensions", "time_range",
-            "unit", "sql_fingerprint", "compiler",
+            "unit", "sql_fingerprint", "compiler", "clarification",
+            "clarification_reason", "repairs",
         )
         if key in state
     }
@@ -206,7 +209,7 @@ def metric_query(body: InternalMetricQuestion, request: Request):
     try:
         state = graph.invoke(
             {"question": body.question, "datasource_id": body.datasource_id},
-            {"recursion_limit": 14},
+            {"recursion_limit": recursion_limit() + 1},
         )
     except Exception:
         state = {"status": "failed", "error": "graph_execution_failed"}
@@ -216,7 +219,7 @@ def metric_query(body: InternalMetricQuestion, request: Request):
             "status", "error", "metric_id", "metric_code", "metric_name",
             "metric_version_id", "metric_version", "dimensions", "time_range",
             "unit", "sql_fingerprint", "compiler", "columns", "rows",
-            "row_count", "truncated",
+            "row_count", "truncated", "clarification", "clarification_reason", "repairs",
         )
         if key in state
     }

@@ -1,16 +1,18 @@
 # Metric planning evaluation: metric-sales-v1
 
 - Mode: `scripted`; candidate recall: `legacy exact match`; today: 2026-09-25T10:00:00 (Asia/Shanghai)
-- Passed: **38/43** (88%)
-- Gold metric among candidates: 88% of 41 answerable cases
-- Tokens: n/a; latency p50 11.0 ms, p95 12.3 ms
+- Passed: **42/47** (89%)
+- Gold metric among candidates: 89% of 44 answerable cases
+- Model calls: 39 (repairs 0, passed after repair 0); clarifications 0
+- Tokens: n/a; latency p50 18.3 ms, p95 21.5 ms
 
 | Category | Passed |
 | --- | --- |
 | basic | 4/4 |
 | dimension | 4/4 |
 | filter | 8/8 |
-| refusal | 2/2 |
+| follow_up | 3/3 |
+| refusal | 3/3 |
 | synonym | 4/9 |
 | time_absolute | 6/6 |
 | time_relative | 10/10 |

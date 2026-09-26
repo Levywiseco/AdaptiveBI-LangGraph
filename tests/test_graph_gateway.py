@@ -1051,7 +1051,7 @@ def test_graph_chat_stream_emits_legacy_events_and_persists_record(configured, m
     enable_graph_engine(monkeypatch)
     result = completed_query_result()
 
-    async def fake_run(uid, oid, question, datasource_id):
+    async def fake_run(uid, oid, question, datasource_id, context=()):
         assert (uid, oid, datasource_id) == (7, 2, 3)
         return result
 
@@ -1092,7 +1092,7 @@ def test_graph_chat_stream_maps_rejections_and_does_not_fall_back(configured, mo
     result = completed_query_result().model_copy(
         update={"status": "rejected", "error": "metric_not_found", "rows": [], "row_count": 0})
 
-    async def fake_run(uid, oid, question, datasource_id):
+    async def fake_run(uid, oid, question, datasource_id, context=()):
         return result
 
     monkeypatch.setattr(chat_stream, "run_metric_query", fake_run)
@@ -1112,7 +1112,7 @@ def test_graph_chat_stream_maps_gateway_outage(configured, monkeypatch):
     from apps.graph_gateway import chat_stream
     enable_graph_engine(monkeypatch)
 
-    async def failing_run(uid, oid, question, datasource_id):
+    async def failing_run(uid, oid, question, datasource_id, context=()):
         raise HTTPException(502, "graph_unavailable")
 
     monkeypatch.setattr(chat_stream, "run_metric_query", failing_run)
@@ -1312,7 +1312,7 @@ def test_graph_chat_names_the_conversation_after_its_first_question_only(configu
     from apps.graph_gateway import chat_stream
     enable_graph_engine(monkeypatch)
 
-    async def fake_run(uid, oid, question, datasource_id):
+    async def fake_run(uid, oid, question, datasource_id, context=()):
         return completed_query_result()
 
     monkeypatch.setattr(chat_stream, "run_metric_query", fake_run)
@@ -1324,3 +1324,108 @@ def test_graph_chat_names_the_conversation_after_its_first_question_only(configu
             _, events = collect_sse(response)
             assert ("brief" in [event["type"] for event in events]) is (question == "八月东部净销售额")
         assert session.get(Chat, 1).brief == "八月东部净销售额"
+
+
+# --- Follow-ups, clarification and bounded repair ---
+
+def test_metric_delegation_binds_conversation_context(configured):
+    body = InternalMetricQuestion(question="那7月呢？", datasource_id=3, run_id=uuid4(),
+                                  context=["8月各区域净销售额"])
+    token = security.issue_metric_query_delegation(7, 2, body.run_id, body.question, 3, body.context)
+    request = Request({"type": "http", "headers": [(b"x-graph-service", b"b" * 32),
+                                                      (b"x-graph-delegation", token.encode())]})
+    assert security.verify_metric_request(request, body)["sub"] == "7"
+    for changed in ([], ["别的问题"], ["8月各区域净销售额", "追加"]):
+        with pytest.raises(HTTPException):
+            security.verify_metric_request(request, body.model_copy(update={"context": changed}))
+    # Without context the hash is unchanged from earlier releases.
+    assert security.fingerprint("q", 3) == security.fingerprint("q", 3, [])
+
+
+@pytest.mark.parametrize("context", [["x"] * 4, [""], ["x" * 2001]])
+def test_context_is_bounded(context):
+    from pydantic import ValidationError
+    with pytest.raises(ValidationError):
+        InternalMetricQuestion(question="q", datasource_id=3, run_id=uuid4(), context=context)
+
+
+def test_follow_up_recall_adds_metrics_from_earlier_questions(configured, monkeypatch):
+    calls = []
+
+    def candidates(session, text, oid, datasource_id, limit, current_user):
+        calls.append(text)
+        return [dict(metric_candidate(), metric_version_id=27)] if "净销售额" in text else []
+
+    monkeypatch.setattr(service, "get_metric_candidates", candidates)
+    claims = {"sub": "7", "workspace": "2"}
+    result = service.authorized_metric_candidates(claims, "那7月呢？", 3, ["8月各区域净销售额"])
+    assert [item["metric_version_id"] for item in result] == [27]
+    assert calls == ["那7月呢？", "8月各区域净销售额"]
+    assert service.authorized_metric_candidates(claims, "那7月呢？", 3) == []
+
+
+def test_metric_model_sends_context_and_repairs_to_the_provider(configured, monkeypatch):
+    from apps.ai_model.model_factory import LLMConfig
+    captured = []
+    monkeypatch.setattr(service, "authorized_metric_candidates", lambda *args: [metric_candidate()])
+
+    async def config(model_id):
+        return LLMConfig(model_id=10, model_type="openai", model_name="test")
+
+    class Model:
+        async def ainvoke(self, messages):
+            captured.extend(messages)
+            return SimpleNamespace(content="{}", usage_metadata=None)
+
+    monkeypatch.setattr(service, "get_default_config", config)
+    monkeypatch.setattr(service.LLMFactory, "create_llm", lambda _: SimpleNamespace(llm=Model()))
+    asyncio.run(service.invoke_metric_model(
+        {"sub": "7", "workspace": "2", "model_id": 10, "run_id": "run"}, "那7月呢？", 3,
+        [MetricCandidateRef(metric_id=9, metric_version_id=27)], ["8月各区域净销售额"],
+        [{"previous": '{"metric_id": 99}', "error": "metric_not_authorized"}]))
+    system, question, previous, correction = captured
+    assert "1. 8月各区域净销售额" in system.content and "Keep the earlier metric" in system.content
+    assert '"clarification"' in system.content
+    assert question.content == "那7月呢？" and previous.content == '{"metric_id": 99}'
+    assert "metric_not_authorized" in correction.content and "copied together" in correction.content
+
+
+def test_model_request_accepts_only_known_repair_codes():
+    from pydantic import ValidationError
+
+    from apps.graph_gateway.contracts import MetricModelRequest
+    base = {"question": "q", "datasource_id": 3, "run_id": str(uuid4()),
+            "candidates": [{"metric_id": 9, "metric_version_id": 27}]}
+    MetricModelRequest.model_validate({**base, "repairs": [{"previous": "{}", "error": "metric_plan_invalid"}]})
+    for repairs in ([{"previous": "{}", "error": "gateway_rejected"}],
+                    [{"previous": "", "error": "metric_plan_invalid"}],
+                    [{"previous": "{}", "error": "metric_plan_invalid"}] * 4):
+        with pytest.raises(ValidationError):
+            MetricModelRequest.model_validate({**base, "repairs": repairs})
+
+
+def test_graph_chat_sends_earlier_questions_and_shows_clarifications(configured, monkeypatch):
+    from apps.graph_gateway import chat_stream
+    enable_graph_engine(monkeypatch)
+    seen = []
+
+    async def fake_run(uid, oid, question, datasource_id, context=()):
+        seen.append(list(context))
+        if question == "上个月卖了多少钱":
+            return completed_query_result().model_copy(update={
+                "status": "needs_clarification", "clarification": "您想看成交总额还是净销售额？",
+                "clarification_reason": "ambiguous", "rows": [], "row_count": 0})
+        return completed_query_result()
+
+    monkeypatch.setattr(chat_stream, "run_metric_query", fake_run)
+    with Session(configured) as session:
+        user = chat_user(session)
+        responses = []
+        for question in ("上个月卖了多少钱", "净销售额", "那7月呢？"):
+            responses.append(collect_sse(asyncio.run(chat_stream.maybe_stream_graph_answer(
+                session, user, ChatQuestion(chat_id=1, question=question))))[1])
+        clarification = responses[0][-1]
+        assert clarification["type"] == "error"
+        assert clarification["content"] == "需要确认：您想看成交总额还是净销售额？"
+        assert "需要确认" in session.get(ChatRecord, 1).error
+    assert seen == [[], ["上个月卖了多少钱"], ["上个月卖了多少钱", "净销售额"]]

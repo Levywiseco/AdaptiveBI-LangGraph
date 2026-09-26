@@ -107,18 +107,38 @@ def _current_user(session: Session, uid: int, oid: int) -> UserInfoDTO:
     return result
 
 
-def authorized_metric_candidates(claims, question: str, datasource_id: int):
+CANDIDATE_LIMIT = 10
+
+
+def candidates_with_context(session: Session, question: str, oid: int, datasource_id: int,
+                            current_user, context=(), recall=None) -> list[dict]:
+    """Candidates for the question first; a follow-up such as "那7月呢？" also
+    recalls metrics from the earlier questions of the conversation."""
+    recall = recall or get_metric_candidates
+    candidates = recall(session, question, oid, datasource_id, limit=CANDIDATE_LIMIT,
+                        current_user=current_user)
+    if context and len(candidates) < CANDIDATE_LIMIT:
+        seen = {item["metric_version_id"] for item in candidates}
+        for item in recall(session, "\n".join(context), oid, datasource_id, limit=CANDIDATE_LIMIT,
+                           current_user=current_user):
+            if item["metric_version_id"] not in seen and len(candidates) < CANDIDATE_LIMIT:
+                candidates.append(item)
+                seen.add(item["metric_version_id"])
+    return candidates
+
+
+def authorized_metric_candidates(claims, question: str, datasource_id: int, context=()):
     uid, oid = int(claims["sub"]), int(claims["workspace"])
     authorize_current(uid, oid)
     with Session(engine) as session:
         current_user = _current_user(session, uid, oid)
-        return get_metric_candidates(
-            session, question, oid, datasource_id, limit=10, current_user=current_user
-        )
+        return candidates_with_context(session, question, oid, datasource_id, current_user, context,
+                                       recall=get_metric_candidates)
 
 
-async def invoke_metric_model(claims, question: str, datasource_id: int, candidate_refs):
-    candidates = authorized_metric_candidates(claims, question, datasource_id)
+async def invoke_metric_model(claims, question: str, datasource_id: int, candidate_refs,
+                              context=(), repairs=()):
+    candidates = authorized_metric_candidates(claims, question, datasource_id, context)
     requested = {(item.metric_id, item.metric_version_id) for item in candidate_refs}
     if len(requested) != len(candidate_refs):
         raise HTTPException(422, "metric_candidates_invalid")
@@ -136,7 +156,8 @@ async def invoke_metric_model(claims, question: str, datasource_id: int, candida
         if item["metric_version_id"] in known_values else item
         for item in selected
     ]
-    messages = metric_planning_messages(question, prompt_candidates, planning_now())
+    messages = metric_planning_messages(question, prompt_candidates, planning_now(),
+                                        context=list(context), repairs=list(repairs))
     step_timeout(claims, MODEL_STEP_SECONDS)  # refuse to start a call that cannot finish
     try:
         await asyncio.wait_for(MODEL_SLOTS.acquire(), timeout=0.2)
@@ -340,7 +361,8 @@ async def invoke_model(claims, question):
         MODEL_SLOTS.release()
 
 
-async def run_metric_query(uid: int, oid: int, question: str, datasource_id: int) -> MetricQueryResponse:
+async def run_metric_query(uid: int, oid: int, question: str, datasource_id: int,
+                           context=()) -> MetricQueryResponse:
     """Plan and execute one governed metric query through the graph service.
 
     Shared by the analysis endpoint and the chat-engine router; the response is
@@ -349,13 +371,14 @@ async def run_metric_query(uid: int, oid: int, question: str, datasource_id: int
     metric_datasource_enabled(datasource_id)
     authorize_current(uid, oid)
     run_id = uuid4()
-    token = issue_metric_query_delegation(uid, oid, run_id, question, datasource_id)
+    token = issue_metric_query_delegation(uid, oid, run_id, question, datasource_id, context)
     try:
         async with httpx.AsyncClient(timeout=request_budget_seconds(), follow_redirects=False,
                                      trust_env=False) as client:
             response = await client.post(
                 settings.GRAPH_SERVICE_URL.rstrip("/") + "/internal/v1/metrics/query",
-                json={"question": question, "datasource_id": datasource_id, "run_id": str(run_id)},
+                json={"question": question, "datasource_id": datasource_id,
+                      "context": list(context), "run_id": str(run_id)},
                 headers={"X-Graph-Service": settings.BACKEND_TO_GRAPH_TOKEN,
                          "X-Graph-Delegation": token},
             )

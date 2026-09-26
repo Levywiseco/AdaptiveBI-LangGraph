@@ -315,3 +315,71 @@ def test_gateway_maps_timeouts_after_deadline_to_deadline_error(monkeypatch):
     with pytest.raises(ModelCallError) as error:
         gateway.execute(plan())
     assert error.value.code == "graph_deadline_exceeded"
+
+
+def test_conversation_context_is_bound_by_the_signed_hash(metric_query_experiment, monkeypatch):
+    body, headers = metric_query_experiment
+    calls = stub_backend(monkeypatch)
+    followup = {**body, "context": ["2026年8月各区域净销售额"]}
+    signed = hashlib.sha256(
+        ("3\n" + body["question"] + "\n" + json.dumps(followup["context"], ensure_ascii=False)).encode()
+    ).hexdigest()
+    assert request_metric_query(followup, headers({"request_hash": signed})).status_code == 200
+    # Context added or changed after signing is rejected before any backend call.
+    calls.clear()
+    assert request_metric_query(followup, headers()).status_code == 401
+    tampered = {**followup, "context": ["别的问题"]}
+    assert request_metric_query(tampered, headers({"request_hash": signed})).status_code == 401
+    assert calls == []
+
+
+def test_repairs_are_sent_to_the_gateway_and_usage_accumulates(metric_query_experiment, monkeypatch):
+    body, headers = metric_query_experiment
+    sent = []
+    replies = iter([raw_plan(dimensions=["secret_column"]), raw_plan()])
+
+    def post(self, url, **kwargs):
+        name = url.rsplit("/", 1)[-1]
+        if name == "authorize":
+            payload = {"authorized": True}
+        elif name == "candidates":
+            payload = {"candidates": [json.loads(candidate().model_dump_json())]}
+        elif name == "model":
+            sent.append(kwargs["json"]["repairs"])
+            payload = {"content": next(replies), "model_calls": 1,
+                       "usage": {"input_tokens": 100, "output_tokens": 10, "total_tokens": 110}}
+        elif name == "compile":
+            payload = {"metric_id": 9, "metric_code": "net_sales", "metric_name": "Net sales",
+                       "metric_version_id": 27, "metric_version": 3, "dimensions": ["region"],
+                       "time_range": None, "sql_fingerprint": "a" * 64, "compiler": "metric-plan-v1"}
+        else:
+            payload = executed_payload()
+        return httpx.Response(200, json={"code": 0, "msg": None, "data": payload},
+                              request=httpx.Request("POST", url))
+
+    monkeypatch.setattr(httpx.Client, "post", post)
+    data = request_metric_query(body, headers()).json()
+    assert data["status"] == "completed" and data["repairs"] == 1
+    assert sent[0] == [] and sent[1][0]["error"] == "metric_dimension_not_allowed"
+    assert data["model_calls"] == 2
+    assert data["usage"] == {"input_tokens": 200, "output_tokens": 20, "total_tokens": 220}
+
+
+def test_clarification_is_returned_without_rows(metric_query_experiment, monkeypatch):
+    body, headers = metric_query_experiment
+    reply = json.dumps({"clarification": "您想看成交总额还是净销售额？", "reason": "ambiguous"},
+                       ensure_ascii=False)
+
+    def post(self, url, **kwargs):
+        name = url.rsplit("/", 1)[-1]
+        payload = ({"authorized": True} if name == "authorize" else
+                   {"candidates": [json.loads(candidate().model_dump_json())]} if name == "candidates" else
+                   {"content": reply, "model_calls": 1, "usage": {}})
+        assert name in {"authorize", "candidates", "model"}
+        return httpx.Response(200, json={"code": 0, "msg": None, "data": payload},
+                              request=httpx.Request("POST", url))
+
+    monkeypatch.setattr(httpx.Client, "post", post)
+    data = request_metric_query(body, headers()).json()
+    assert data["status"] == "needs_clarification" and data["clarification_reason"] == "ambiguous"
+    assert data["clarification"] == "您想看成交总额还是净销售额？" and data["rows"] == []

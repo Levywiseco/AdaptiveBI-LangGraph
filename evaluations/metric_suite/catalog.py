@@ -85,7 +85,7 @@ def generate_orders() -> list[dict[str, Any]]:
 
 def write_orders(orders: list[dict[str, Any]], path: Path = DATA_FILE) -> None:
     with path.open("w", encoding="utf-8", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=COLUMNS)
+        writer = csv.DictWriter(handle, fieldnames=COLUMNS, lineterminator="\n")
         writer.writeheader()
         for order in orders:
             writer.writerow({**order, "paid_at": order["paid_at"].strftime("%Y-%m-%d %H:%M:%S")})
